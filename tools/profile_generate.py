@@ -56,8 +56,11 @@ pub const ValueName = struct {{
     name: []const u8,
 }};
 
+/// A type whose values are names (an enumeration), or, when `mask` is nonzero, a bit field: the
+/// number under `mask` plus the single-bit flags in `values`.
 pub const Type = struct {{
     name: []const u8,
+    mask: u32 = 0,
     values: []const ValueName,
 }};
 """
@@ -143,6 +146,23 @@ def struct_write(lines, indent, parts):
     lines.append(" " * indent + "},")
 
 
+def type_split(values):
+    """A type with a value named "mask" is a bit field (message_index, left_right_balance): the
+    number under the mask, plus single-bit flags. Its "mask" and "reserved" entries describe the
+    layout, not values, so only the flags are kept."""
+    masks = [value for value, name in values.items() if name == "mask"]
+    if not masks:
+        return 0, values
+    assert len(masks) == 1
+    mask = masks[0]
+    flags = {value: name for value, name in values.items() if name not in ("mask", "reserved")}
+    assert 1 <= len(flags) <= 4, flags
+    for flag in flags:
+        # Each flag is one bit, outside the number.
+        assert flag & (flag - 1) == 0 and flag & mask == 0, flags
+    return mask, flags
+
+
 def used_types(profile):
     names = set()
     for message in profile["messages"].values():
@@ -178,11 +198,12 @@ def main():
     lines.append("")
     lines.append("pub const types = [_]Type{")
     for name in types:
-        lines.append(f"    .{{ .name = {zig_string(name)}, .values = &.{{")
-        for value in sorted(profile["types"][name]):
+        mask, values = type_split(profile["types"][name])
+        mask_part = f".mask = 0x{mask:X}, " if mask else ""
+        lines.append(f"    .{{ .name = {zig_string(name)}, {mask_part}.values = &.{{")
+        for value in sorted(values):
             assert 0 <= int(value) < 2**32
-            value_name = profile["types"][name][value]
-            struct_write(lines, 8, [f".value = {value}", f".name = {zig_string(value_name)}"])
+            struct_write(lines, 8, [f".value = {value}", f".name = {zig_string(values[value])}"])
         lines.append("    } },")
     lines.append("};")
     print("\n".join(lines))

@@ -38,8 +38,9 @@ record
 ```
 
 It shows only the fields the profile knows and that hold data, with
-scale and offset applied and enumerated values named (`sport  running`),
-then the developer fields the file
+scale and offset applied, enumerated values named (`sport  running`),
+and bit-field values split into flags and number (`message_index  selected
+3`), then the developer fields the file
 describes by name (`Heart Rate  82 bpm`, the name as the file writes it),
 and skips a message with nothing to show (the summary still counts it).
 To pull out one kind of message, use awk's paragraph mode:
@@ -154,8 +155,9 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   depends on another (event `data`, file_id `product`) keeps its generic
   name, and a component (record `speed` into `enhanced_speed`, bit-packed
   `compressed_speed_distance`) isn't expanded. A bit-field type names only
-  single bits, not combinations. `--dump --all` keeps enumerated values
-  as numbers
+  single bits, not combinations, except the masked types (message_index,
+  left_right_balance), whose values split into flags and a number.
+  `--dump --all` keeps these values as stored numbers
 - Strict on base types: a non-canonical base type byte (e.g. `0x04`
   instead of `0x84`) or a field size that isn't a multiple of its base
   type size is rejected, where the FIT SDK falls back to a byte array.

@@ -43,6 +43,21 @@ pub fn semicircles_degrees(semicircles: f64) f64 {
     return degrees;
 }
 
+/// A masked type has at most this many flags; the generator checks it.
+const masked_flag_count_max = 4;
+
+pub const MaskedValue = struct {
+    number: u64,
+    flag_names: [masked_flag_count_max][]const u8 = undefined,
+    flag_count: u8 = 0,
+
+    /// The set flags, in increasing bit order.
+    pub fn flags(self: *const MaskedValue) []const []const u8 {
+        assert(self.flag_count <= masked_flag_count_max);
+        return self.flag_names[0..self.flag_count];
+    }
+};
+
 pub const FieldProfile = struct {
     /// snake_case, as in the FIT profile.
     name: []const u8,
@@ -62,10 +77,12 @@ pub const FieldProfile = struct {
 
     /// The profile's name for an unsigned value (`sport` 1 is "running"), or null when the
     /// field has no named values or this value isn't one of them. A bit-field type names only
-    /// its single bits, so a combination of them has no name.
+    /// its single bits, so a combination of them has no name. A masked type's values are
+    /// numbers, not names: see `masked`.
     pub fn value_name(self: *const FieldProfile, value: fit.Value) ?[]const u8 {
         const type_index = self.type_index orelse return null;
         assert(self.kind == .number);
+        if (generated.types[type_index].mask != 0) return null;
         const unsigned = switch (value) {
             .unsigned => |unsigned| unsigned,
             .signed, .float, .string, .bytes => return null,
@@ -79,6 +96,33 @@ pub const FieldProfile = struct {
         ) orelse return null;
         assert(values[index].value == unsigned);
         return values[index].name;
+    }
+
+    /// Splits a value of a masked type (message_index, left_right_balance) into the number under
+    /// the mask and the names of the flags set above it. Null when the field's type isn't
+    /// masked, or when a bit is set that is neither under the mask nor a known flag, so no bit
+    /// is silently dropped.
+    pub fn masked(self: *const FieldProfile, value: fit.Value) ?MaskedValue {
+        const type_index = self.type_index orelse return null;
+        const value_type = &generated.types[type_index];
+        if (value_type.mask == 0) return null;
+        assert(value_type.values.len <= masked_flag_count_max);
+        const unsigned = switch (value) {
+            .unsigned => |unsigned| unsigned,
+            .signed, .float, .string, .bytes => return null,
+        };
+
+        var result = MaskedValue{ .number = unsigned & value_type.mask };
+        var bits_named: u64 = value_type.mask;
+        for (value_type.values) |flag| {
+            if (unsigned & flag.value == 0) continue;
+            result.flag_names[result.flag_count] = flag.name;
+            result.flag_count += 1;
+            bits_named |= flag.value;
+        }
+        if (unsigned & ~bits_named != 0) return null;
+        assert(result.number <= value_type.mask);
+        return result;
     }
 
     /// Applies scale and offset to one element. Returns null for a string or byte value: the
@@ -357,4 +401,29 @@ test "developer_field_profile: carries the description's name, units, scale and 
     try std.testing.expectEqualStrings("", unnamed.name);
     try std.testing.expectEqualStrings("", unnamed.units);
     try std.testing.expect(!unnamed.is_scaled());
+}
+
+test "FieldProfile.masked: the number under the mask, and the flags above it" {
+    const message_index = field_profile(19, 254).?; // lap.message_index
+    const plain = message_index.masked(.{ .unsigned = 3 }).?;
+    try testing.expectEqual(@as(u64, 3), plain.number);
+    try testing.expectEqual(@as(usize, 0), plain.flags().len);
+    const selected = message_index.masked(.{ .unsigned = 0x8000 | 0xFFF }).?;
+    try testing.expectEqual(@as(u64, 0xFFF), selected.number);
+    try testing.expectEqualStrings("selected", selected.flags()[0]);
+    // The reserved bits 0x7000 are neither number nor flag.
+    try testing.expectEqual(null, message_index.masked(.{ .unsigned = 0x1000 }));
+    try testing.expectEqual(null, message_index.masked(.{ .signed = 3 }));
+    // A masked type's values are numbers: 0xFFF isn't "mask".
+    try testing.expectEqual(null, message_index.value_name(.{ .unsigned = 0xFFF }));
+
+    const balance = field_profile(20, 30).?; // record.left_right_balance, uint8
+    const right = balance.masked(.{ .unsigned = 0x80 | 52 }).?;
+    try testing.expectEqual(@as(u64, 52), right.number);
+    try testing.expectEqualStrings("right", right.flags()[0]);
+    try testing.expectEqual(@as(u64, 0x7F), balance.masked(.{ .unsigned = 0x7F }).?.number);
+
+    // Not a masked type.
+    try testing.expectEqual(null, field_profile(18, 5).?.masked(.{ .unsigned = 1 }));
+    try testing.expectEqual(null, field_profile(20, 3).?.masked(.{ .unsigned = 1 }));
 }

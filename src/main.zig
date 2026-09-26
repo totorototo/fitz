@@ -529,13 +529,14 @@ fn field_value_write(
     if (element_count == 1) {
         // A single "no data" value gets no units: `heart_rate=-`, not `heart_rate=-bpm`.
         const value = field.element(0) orelse return writer.writeByte('-');
-        try element_write(writer, value, field_profile, detail);
+        try element_write(writer, value, field.base_type, field_profile, detail);
     } else {
         try writer.writeByte('[');
         var index: u8 = 0;
         while (index < element_count) : (index += 1) {
             if (index > 0) try writer.writeByte(',');
-            try element_write(writer, field.element(index), field_profile, detail);
+            const value = field.element(index);
+            try element_write(writer, value, field.base_type, field_profile, detail);
         }
         try writer.writeByte(']');
     }
@@ -551,34 +552,63 @@ fn field_value_write(
 }
 
 /// Invalid (sentinel) elements print as `-`, so "no data" never looks like a real number.
-/// In readable detail, a value the profile names prints its name (`running`), and dates and
-/// positions are converted; a scaled field prints its physical value; everything else prints
-/// the raw value exactly. Full detail prints the stored number, not a name.
+/// In readable detail, a value the profile names prints its name (`running`), a masked value
+/// prints its flags then its number (`selected 3`), and dates and positions are converted.
+/// Otherwise a scaled field prints its physical value, and everything else its raw value.
+/// Full detail prints the stored number, not a name.
 fn element_write(
     writer: *std.Io.Writer,
     value: ?fitz.Value,
+    base_type: fitz.BaseType,
     field_profile: ?*const fitz.profile.FieldProfile,
     detail: DumpDetail,
 ) !void {
     const present = value orelse return writer.writeByte('-');
-    if (field_profile) |profile| {
-        if (detail == .readable) {
-            if (profile.value_name(present)) |name| return writer.writeAll(name);
+    const profile = field_profile orelse return number_write(writer, present, base_type, null);
+    if (detail == .readable) {
+        if (profile.value_name(present)) |name| return writer.writeAll(name);
+        if (profile.masked(present)) |masked| {
+            for (masked.flags()) |flag| try writer.print("{s} ", .{flag});
+            const number = fitz.Value{ .unsigned = masked.number };
+            return number_write(writer, number, base_type, profile);
         }
-        if (detail == .readable and profile.kind != .number) {
+        if (profile.kind != .number) {
             if (try converted_write(writer, present, profile.kind)) return;
         }
+    }
+    try number_write(writer, present, base_type, profile);
+}
+
+/// The physical value when the profile scales the field, else the raw value exactly.
+fn number_write(
+    writer: *std.Io.Writer,
+    value: fitz.Value,
+    base_type: fitz.BaseType,
+    field_profile: ?*const fitz.profile.FieldProfile,
+) !void {
+    if (field_profile) |profile| {
         if (profile.is_scaled()) {
             // A string or byte value has nothing to scale, so it falls through to the raw form.
-            if (profile.scaled(present)) |scaled| return writer.print("{d}", .{scaled});
+            if (profile.scaled(value)) |scaled| return float_write(writer, scaled, base_type);
         }
     }
-    switch (present) {
+    switch (value) {
         .unsigned => |unsigned| try writer.print("{d}", .{unsigned}),
         .signed => |signed| try writer.print("{d}", .{signed}),
-        .float => |float| try writer.print("{d}", .{float}),
+        .float => |float| try float_write(writer, float, base_type),
         .string => |string| try writer.print("\"{s}\"", .{string}),
         .bytes => |bytes| try writer.print("0x{x}", .{bytes}),
+    }
+}
+
+/// A float32 prints at float32 precision: widened to f64 it shows digits past what a float32
+/// holds (4.304000377655029, where the float32 itself prints as 4.3040004). Anything else
+/// prints as f64, whose shortest form is exact for integer raw values scaled once.
+fn float_write(writer: *std.Io.Writer, value: f64, base_type: fitz.BaseType) !void {
+    assert(base_type != .string and base_type != .byte);
+    switch (base_type) {
+        .float32 => try writer.print("{d}", .{@as(f32, @floatCast(value))}),
+        else => try writer.print("{d}", .{value}),
     }
 }
 
@@ -714,17 +744,30 @@ test "options_parse" {
 
 test "element_write: every representation and the invalid marker" {
     var buffer: [64]u8 = undefined;
-    const cases = [_]struct { value: ?fitz.Value, expected: []const u8 }{
-        .{ .value = null, .expected = "-" },
-        .{ .value = .{ .unsigned = std.math.maxInt(u64) }, .expected = "18446744073709551615" },
-        .{ .value = .{ .signed = -100 }, .expected = "-100" },
-        .{ .value = .{ .float = 0.5 }, .expected = "0.5" },
-        .{ .value = .{ .string = "hi" }, .expected = "\"hi\"" },
-        .{ .value = .{ .bytes = &.{ 0xDE, 0x01 } }, .expected = "0xde01" },
+    const float32_widened: f64 = @as(f32, 4.304);
+    const Case = struct { value: ?fitz.Value, base_type: fitz.BaseType, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .value = null, .base_type = .uint8, .expected = "-" },
+        .{
+            .value = .{ .unsigned = std.math.maxInt(u64) },
+            .base_type = .uint64,
+            .expected = "18446744073709551615",
+        },
+        .{ .value = .{ .signed = -100 }, .base_type = .sint8, .expected = "-100" },
+        .{ .value = .{ .float = 0.5 }, .base_type = .float64, .expected = "0.5" },
+        // A float32 prints at its own precision, not as the f64 it was widened to.
+        .{ .value = .{ .float = float32_widened }, .base_type = .float32, .expected = "4.304" },
+        .{
+            .value = .{ .float = float32_widened },
+            .base_type = .float64,
+            .expected = "4.303999900817871",
+        },
+        .{ .value = .{ .string = "hi" }, .base_type = .string, .expected = "\"hi\"" },
+        .{ .value = .{ .bytes = &.{ 0xDE, 0x01 } }, .base_type = .byte, .expected = "0xde01" },
     };
     for (cases) |case| {
         var writer = std.Io.Writer.fixed(&buffer);
-        try element_write(&writer, case.value, null, .all);
+        try element_write(&writer, case.value, case.base_type, null, .all);
         try testing.expectEqualStrings(case.expected, writer.buffered());
     }
 }
@@ -784,16 +827,53 @@ test "element_write: scaled values, and a string in a scaled field" {
     var buffer: [64]u8 = undefined;
 
     var writer = std.Io.Writer.fixed(&buffer);
-    try element_write(&writer, .{ .unsigned = 6460 }, &altitude, .readable);
+    try element_write(&writer, .{ .unsigned = 6460 }, .uint32, &altitude, .readable);
     try testing.expectEqualStrings("792", writer.buffered());
 
     writer = std.Io.Writer.fixed(&buffer);
-    try element_write(&writer, .{ .string = "odd" }, &altitude, .readable);
+    try element_write(&writer, .{ .string = "odd" }, .string, &altitude, .readable);
     try testing.expectEqualStrings("\"odd\"", writer.buffered());
 
     writer = std.Io.Writer.fixed(&buffer);
-    try element_write(&writer, null, &altitude, .readable);
+    try element_write(&writer, null, .uint32, &altitude, .readable);
     try testing.expectEqualStrings("-", writer.buffered());
+
+    // A scaled float32 keeps float32 precision: 4304.0 / 1000 m/s.
+    const speed = fitz.profile.field_profile(20, 6).?;
+    writer = std.Io.Writer.fixed(&buffer);
+    try element_write(&writer, .{ .float = 4304 }, .float32, &speed, .readable);
+    try testing.expectEqualStrings("4.304", writer.buffered());
+}
+
+test "element_write: masked values print their flags, then their number" {
+    const message_index = fitz.profile.field_profile(19, 254).?;
+    const balance = fitz.profile.field_profile(20, 30).?;
+    const Case = struct {
+        profile: *const fitz.profile.FieldProfile,
+        value: u64,
+        detail: DumpDetail,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .profile = &message_index, .value = 3, .detail = .readable, .expected = "3" },
+        .{
+            .profile = &message_index,
+            .value = 0x8FFF,
+            .detail = .readable,
+            .expected = "selected 4095",
+        },
+        // A reserved bit is set: the raw number, rather than a number missing a bit.
+        .{ .profile = &message_index, .value = 0x1003, .detail = .readable, .expected = "4099" },
+        .{ .profile = &balance, .value = 0x80 | 52, .detail = .readable, .expected = "right 52" },
+        // Full detail keeps the stored number.
+        .{ .profile = &balance, .value = 0x80 | 52, .detail = .all, .expected = "180" },
+    };
+    var buffer: [32]u8 = undefined;
+    for (cases) |case| {
+        var writer = std.Io.Writer.fixed(&buffer);
+        try element_write(&writer, .{ .unsigned = case.value }, .uint16, case.profile, case.detail);
+        try testing.expectEqualStrings(case.expected, writer.buffered());
+    }
 }
 
 test "MessageLabel: name when known, number otherwise" {

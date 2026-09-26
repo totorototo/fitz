@@ -33,8 +33,11 @@ pub const ValueName = struct {
     name: []const u8,
 };
 
+/// A type whose values are names (an enumeration), or, when `mask` is nonzero, a bit field: the
+/// number under `mask` plus the single-bit flags in `values`.
 pub const Type = struct {
     name: []const u8,
+    mask: u32 = 0,
     values: []const ValueName,
 };
 
@@ -2985,12 +2988,10 @@ pub const types = [_]Type{
         .{ .value = 7, .name = "session_end" },
         .{ .value = 8, .name = "fitness_equipment" },
     } },
-    .{ .name = "left_right_balance", .values = &.{
-        .{ .value = 127, .name = "mask" },
+    .{ .name = "left_right_balance", .mask = 0x7F, .values = &.{
         .{ .value = 128, .name = "right" },
     } },
-    .{ .name = "left_right_balance_100", .values = &.{
-        .{ .value = 16383, .name = "mask" },
+    .{ .name = "left_right_balance_100", .mask = 0x3FFF, .values = &.{
         .{ .value = 32768, .name = "right" },
     } },
     .{ .name = "length_type", .values = &.{
@@ -3393,9 +3394,7 @@ pub const types = [_]Type{
         .{ .value = 65280, .name = "mfg_range_min" },
         .{ .value = 65534, .name = "mfg_range_max" },
     } },
-    .{ .name = "message_index", .values = &.{
-        .{ .value = 4095, .name = "mask" },
-        .{ .value = 28672, .name = "reserved" },
+    .{ .name = "message_index", .mask = 0xFFF, .values = &.{
         .{ .value = 32768, .name = "selected" },
     } },
     .{ .name = "nap_period_feedback", .values = &.{
