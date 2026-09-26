@@ -2,221 +2,152 @@
 
 [![CI](https://github.com/totorototo/fitz/actions/workflows/ci.yml/badge.svg)](https://github.com/totorototo/fitz/actions/workflows/ci.yml)
 
-Minimal Zig parser for the FIT (Flexible and Interoperable Data Transfer)
-binary format. FIT was authored by Garmin but is an open protocol used
-across the industry — Suunto, Coros, Wahoo and others read and write it
-too, so this isn't Garmin-specific. Library + CLI, built to grow feature
-by feature rather than all at once.
+A small Zig library and CLI for reading **FIT** files, the binary activity format written by
+Garmin, Suunto, Coros, Wahoo and most other sports devices.
 
-## Build
+- Strict: every CRC is checked before anything is returned, so a damaged file is rejected,
+  never half-read.
+- Named: messages, fields, units and enum values come from Garmin's official profile.
+- Zero-copy and streaming: records are views into your buffer, and nothing is decoded
+  until you ask.
+
+Requires **Zig 0.16.0**.
+
+## Quick start
 
 ```sh
-zig build            # builds lib + cli into zig-out/
-zig build test       # runs unit tests and the tests against testdata/; silent on success
-zig build test --summary all   # same, listing each test binary and its pass count
-zig build run -- path/to/file.fit
-zig build run -- --dump path/to/file.fit > dump.txt
-zig build run -- --dump --all path/to/file.fit > dump-all.txt
+zig build
+zig-out/bin/fitz activity.fit                     # summary: header, CRCs, message counts
+zig-out/bin/fitz --dump activity.fit              # every message, readable
+zig-out/bin/fitz --dump --all activity.fit        # every field as stored, one line each
 ```
 
-CI (`.github/workflows/ci.yml`) runs `zig fmt --check`, the 100-column limit, and the build
-and tests in Debug and ReleaseSafe on Linux, macOS and Windows.
-
-Without flags the CLI prints a header line per file (`FIT file 1/2: …`
-for chained files) and a per-message-type count summary, covering every
-file, to stderr. `--dump` also writes each data message to stdout as a
-block meant for reading, one field per line, blocks separated by a blank
-line:
+`--dump` prints a block per message, with values scaled, named and converted
+(dates in ISO 8601, positions in degrees):
 
 ```
+event
+  timestamp             2012-04-09T21:22:26Z
+  timer_trigger         manual
+  event                 timer
+  event_type            start
+
 record
-  timestamp             2026-09-24T10:12:54Z
-  position_lat          45.026082°
-  position_long         -0.808959°
-  enhanced_altitude     24.2 m
-  heart_rate            107 bpm
+  timestamp             2012-04-09T21:22:26Z
+  position_lat          41.513926°
+  position_long         -73.148591°
+  altitude              278.2 m
+  speed                 0 m/s
 ```
 
-It shows only the fields the profile knows and that hold data, with
-scale and offset applied, enumerated values named (`sport  running`),
-and bit-field values split into flags and number (`message_index  selected
-3`), then the developer fields the file
-describes by name (`Heart Rate  82 bpm`, the name as the file writes it),
-and skips a message with nothing to show (the summary still counts it).
-To pull out one kind of message, use awk's paragraph mode:
-`awk -v RS= '/^session\n/' dump.txt`. Dates are
-ISO 8601: UTC with a `Z`, local time (`local_timestamp`) without one, and
-a date_time below `0x10000000` (seconds since the device powered on)
-stays in seconds. Positions are in degrees.
+To keep one kind of message: `fitz --dump file.fit | awk -v RS= '/^session\n/'`.
 
-`--dump --all` prints one line per message, easy to grep, e.g.
-`DATA local=2 global_msg=record timestamp=1159179174s … power=- 140=0`.
-It shows every field as stored, for debugging: `-` for a
-base type's invalid ("no data") sentinel, unknown messages and fields by
-number, and dates and positions in raw seconds and semicircles. Scale and
-offset still apply. Developer fields come last, keyed by developer data
-index and field number rather than by name, which may hold spaces:
-`dev:0:6=82bpm` is index 0, field 6, decoded through its field_description.
-A field the file doesn't describe, or whose size doesn't fit the described
-base type, prints its stored bytes: `dev:0:3=0x5fba8940`. In both modes,
-arrays are in brackets, strings quoted and byte fields hex. A message
-with a compressed-timestamp header gets
-its rebuilt timestamp printed first, and the summary counts how many
-there were. When the buffer chains several files, each one's messages
-follow a marker: a `file 2 of 3` block, or a `FILE 2/3` line with
-`--all`. An empty chained file gets its header line and marker too.
-
-Targets Zig 0.16.0 (explicit `std.Io`, `std.process.Init` main,
-unmanaged containers). Only `main.zig` does I/O; `fit.zig` parses an
-in-memory `[]const u8`, so the core parser is independent of I/O APIs.
-
-## Design note: negative space
-
-Types are structured so invalid states can't be constructed at all,
-rather than being checked for at runtime:
-
-- `RecordHeader` is a tagged union (`normal` / `compressed_timestamp`),
-  not a flat struct with fields that are "only meaningful if kind is
-  X" — there's no bit pattern that produces a compressed header with
-  `is_definition` set, because that field doesn't exist on that branch.
-- `CompressedTimestampHeader.local_message_type` is `u2`, matching the
-  2 bits the spec actually gives it, not `u4` with 12 values that are
-  simply never used.
-- `FileHeader.crc` is `?u16` instead of a `has_crc: bool` paired with a
-  `u16` that has to be kept in sync with it.
-- `FieldDefinition.base_type` is a `BaseType` enum of the 17 canonical
-  bytes, validated when the definition is parsed, and a field's size is
-  checked to be a nonzero multiple of its base type's size. Decoding a
-  data message therefore never meets an unknown type or a misaligned
-  element.
-- `Field.element` returns `?Value`: a base type's "invalid" sentinel
-  (`0xFF`, `0x7FFF`, all-zero for the `z` types, …) comes back as null,
-  not as a magic number the caller must remember.
-
-Error returns (`FitError.*`) are reserved for things that legitimately
-vary in untrusted external bytes — a truncated file, an unknown local
-message type, an unsupported record shape. Anything the parser itself
-guarantees internally (e.g. a local message type always fits the 16-slot
-definitions table because its type is `u4`) is enforced by the types or
-by an `assert`. A failed assert means a bug in fitz, never a bad file.
-
-## What it does
-
-- Parses the 12/14-byte file header (`.FIT` signature, sizes, versions)
-- Parses record headers: normal headers and compressed-timestamp headers
-- Rebuilds compressed timestamps (`DataMessage.compressed_timestamp`):
-  the parser keeps the latest full timestamp (field 253 of any message,
-  or the last rebuilt one) and applies each header's 5-bit offset to it,
-  moving to the next 32-second window when the offset wraps
-- Parses definition messages (local message type table, endianness,
-  global message number, field definitions, developer field definitions)
-- Splits developer fields out of each data message
-  (`DataMessage.developer_fields_iterator()` → `DeveloperField`: developer
-  data index, field number and raw bytes), and reads each file's
-  field_description messages (206) as they come.
-  `parser.developer_field_descriptions.get(&developer)` returns the field's
-  `DeveloperFieldDescription` (base type, name, units, scale, offset), or
-  null when the file hasn't described it. `DeveloperField.field(base_type)`
-  then gives a `Field` that decodes like any other, with the size checked
-  against the base type there. A later description of the same field
-  replaces the earlier one, and each chained file starts with none
-- Parses data messages per the matching definition, and decodes each
-  field's base type (`DataMessage.fields_iterator()` → `Field.element(i)`
-  → `Value`: unsigned, signed, float, string or bytes). Numeric fields
-  whose size is a multiple of the base type size are arrays.
-- Streaming `Parser.next()` — no upfront allocation of the whole record
-  list, only definition field tables are heap-allocated, in an arena
-  freed by `deinit`. A record stays valid until then, even after its
-  local type is redefined or the next chained file starts
-- Reads chained FIT files (several files back to back in one buffer, e.g.
-  an activity followed by settings) in turn. `Parser.init` checks every
-  file first, so a bad later file rejects the whole buffer before any
-  record. Each file starts with no definitions and no timestamp reference;
-  `parser.file_index` / `file_count` tell the files apart. `next()` walks
-  every file in turn; `next_in_file()` stops at the end of each one, and
-  `file_advance()` moves on, so a caller sees every file, an empty one
-  included. Every byte must
-  belong to a file: trailing bytes that aren't a whole valid file are an
-  error, not ignored
-- Verifies CRC-16 (CRC-16/ARC, as in the FIT SDK) in `Parser.init`, for
-  every chained file, before any record is returned: the 14-byte
-  header's CRC when it is nonzero, and the required 2-byte file CRC
-  after the data section, which covers the header and data. The CLI prints each file's
-  `header_crc=ok|absent file_crc=ok(0x…)`
-- The FIT profile (`fitz.profile`), generated from Garmin's FIT SDK
-  (`fitz.profile.version`, 21.217.0): every message's name, every field's
-  name, units, scale and offset, and the names of enumerated values.
-  `message_name(global)`, `field_profile(global, field)`,
-  `FieldProfile.scaled(value)` = raw / scale − offset, and
-  `FieldProfile.value_name(value)` (`sport` 1 is `running`).
-  `FieldProfile.kind` marks dates (UTC or local) and positions, converted
-  with `date_time_unix_s` and `semicircles_degrees`
-- Profile subfields: `data_field_profile(data, field)` gives a field the
-  meaning another field of its message selects (event `data` is
-  `timer_trigger` in a timer event, file_id `product` is `garmin_product`
-  for a Garmin device), with that subfield's name, units, scale and value
-  names. When several match, the first in profile order applies, as in
-  Garmin's decoders. Both `--dump` modes use it; `field_profile` keeps the
-  field's own profile
-
-## What it deliberately doesn't do yet
-
-- Profile components aren't applied: a component (record `speed` into
-  `enhanced_speed`, bit-packed `compressed_speed_distance`, or a subfield's
-  own components such as event `gear_change_data`) isn't expanded. A bit-field type names only
-  single bits, not combinations, except the masked types (message_index,
-  left_right_balance), whose values split into flags and a number.
-  `--dump --all` keeps these values as stored numbers
-- Strict on base types: a non-canonical base type byte (e.g. `0x04`
-  instead of `0x84`) or a field size that isn't a multiple of its base
-  type size is rejected, where the FIT SDK falls back to a byte array.
-  This rejects a real Coros Pace 2 file, which declares an event field as a
-  uint32 of size 1 (`testdata/coros-pace-2-cycling-misaligned-fields.fit`)
-- Strict on compressed timestamps: a compressed header before any full
-  timestamp, one whose definition also has field 253, or one that would
-  overflow `u32` is an error, where the FIT SDK assumes a reference of 0
-- Strict on field_description messages: one without its developer data
-  index, field number or base type, or with a field of the wrong type, is
-  an error (`InvalidFieldDescription`). Its array, components, accumulate
-  and native-field entries aren't used, and developer_data_id (207) is
-  parsed like any other message
-- Strict on CRCs, with no opt-out: a mismatched header or file CRC, or a
-  missing file CRC, rejects the whole file, so a damaged file can't be
-  partially read
-
-## Rough next steps
-
-1. Decide whether to relax the base-type policy to the SDK's byte
-   fallback for mis-sized fields (the Coros file above)
-2. Apply the profile's components
-
-## Layout
+`--dump --all` is meant for grep and debugging: one line per message, every field, raw dates
+and positions, `-` for "no data", unknown fields by number:
 
 ```
-build.zig / build.zig.zon
-src/
-  fit.zig    core parser (Parser, FileHeader, DefinitionMessage, DataMessage, Record)
-             and base-type decoding (BaseType, FieldIterator, Field, Value), developer
-             fields (DeveloperFieldIterator, DeveloperField)
-  profile.zig  FIT profile lookups: message/field names, units, scale, offset, value names,
-               subfields
-  profile_generated.zig  the profile tables, generated from Garmin's FIT SDK; don't edit
-  root.zig   library re-exports (`@import("fitz")`)
-  main.zig   CLI: header info, per-message-type counts, `--dump` of decoded fields
-  fixtures_test.zig  tests against the real files in testdata/
-  snapshots/  approved CLI dumps of a few fixtures, compared by main.zig's tests
-testdata/    third-party FIT fixtures (python-fitparse, MIT); see testdata/README.md
-tools/profile_generate.py  regenerates src/profile_generated.zig
+DATA local=1 global_msg=event timestamp=702940946s timer_trigger=0 event=0 event_type=0
 ```
 
-## Snapshots
+## Using the library
 
-`src/snapshots/` holds the `--dump` and `--dump --all` output of a few
-fixtures, and a test compares the dump with them byte for byte. They catch
-unintended output changes, such as a profile regeneration renaming a field.
-They show what fitz printed when someone last reviewed the output, not what
-is correct; correctness is checked in `fixtures_test.zig`. When a change to
-the output is intended, regenerate them and review the diff:
+Add it to your project:
+
+```sh
+zig fetch --save git+https://github.com/totorototo/fitz
+```
+
+```zig
+// build.zig
+const fitz = b.dependency("fitz", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("fitz", fitz.module("fitz"));
+```
+
+Then walk the records:
+
+```zig
+const std = @import("std");
+const fitz = @import("fitz");
+
+/// Prints every record message's fields, named, scaled and with units.
+fn records_print(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    var parser = try fitz.Parser.init(allocator, bytes); // checks every CRC first
+    defer parser.deinit();
+
+    while (try parser.next()) |record| {
+        const data = switch (record) {
+            .data => |data| data,
+            .definition => continue,
+        };
+        if (data.global_message_number != 20) continue; // 20 is `record`
+
+        var fields = data.fields_iterator();
+        while (fields.next()) |field| {
+            const number = field.field_definition_number;
+            const profile = fitz.profile.data_field_profile(&data, number) orelse continue;
+            const value = field.element(0) orelse continue; // null means "no data"
+            const scaled = profile.scaled(value) orelse continue;
+            std.debug.print("{s} = {d} {s}\n", .{ profile.name, scaled, profile.units });
+        }
+    }
+}
+```
+
+Useful next steps from there:
+
+| You want | Use |
+| --- | --- |
+| An enum value's name (`sport` 1 → `running`) | `profile.value_name(value)` |
+| A date or a position | `profile.kind`, `fitz.profile.date_time_unix_s`, `semicircles_degrees` |
+| Developer fields (Stryd, Connect IQ apps) | `data.developer_fields_iterator()`, `parser.developer_field_descriptions.get(&field)` |
+| Several FIT files chained in one buffer | `parser.file_index` / `file_count`, or `next_in_file()` + `file_advance()` |
+| A message's name | `fitz.profile.message_name(number)` |
+
+The parser does no I/O: you pass it bytes, and a record stays valid until `deinit`.
+
+## What's supported
+
+- File header, header and file CRC-16, chained files
+- Normal and compressed-timestamp record headers (timestamps rebuilt)
+- Definition and data messages, all base types, arrays, "no data" sentinels
+- Garmin FIT profile 21.217.0: message, field and value names, units, scale and offset,
+  and subfields (event `data` becomes `timer_trigger` in a timer event)
+- Developer fields, decoded through the file's field_description messages
+
+**Not yet:** profile components (`speed` → `enhanced_speed`, bit-packed
+`compressed_speed_distance`, accumulated fields).
+
+**Stricter than Garmin's SDK**, on purpose. Each of these is an error rather than a guess:
+
+- a field whose size doesn't match its base type (this rejects a real Coros Pace 2 file,
+  `testdata/coros-pace-2-cycling-misaligned-fields.fit`)
+- a compressed timestamp with no earlier full timestamp to build on
+- a malformed field_description
+- any CRC mismatch, or bytes after the last file
+
+## Development
+
+```sh
+zig build test --summary all        # unit tests, real-file fixtures and CLI snapshots
+```
+
+CI also checks `zig fmt`, a 100-column line limit, and runs the tests in Debug and ReleaseSafe
+on Linux, macOS and Windows. The code follows
+[TigerBeetle's style](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md):
+`FitError` means a bad file, and a failed `assert` means a bug in fitz.
+
+```
+src/fit.zig                 the parser: bytes in, records out, no I/O
+src/profile.zig             profile lookups (names, units, scaling, subfields)
+src/profile_generated.zig   profile tables, generated: don't edit
+src/main.zig                the CLI
+src/fixtures_test.zig       tests against real files in testdata/
+src/snapshots/              approved CLI output, compared byte for byte
+tools/profile_generate.py   regenerates the profile tables
+```
+
+**Snapshots** catch unintended output changes, not correctness (that's `fixtures_test.zig`).
+After an intended change, regenerate and review:
 
 ```sh
 zig build
@@ -227,13 +158,8 @@ done
 git diff src/snapshots
 ```
 
-## Regenerating the profile
-
-`src/profile_generated.zig` comes from `profile.py` in Garmin's
-[FIT Python SDK](https://github.com/garmin/fit-python-sdk), which Garmin
-generates from the SDK's Profile.xlsx. It is derived from the FIT SDK and
-covered by Garmin's FIT Protocol License, not by fitz's own terms. To move
-to a new profile version:
+**The profile** is generated from `profile.py` in Garmin's
+[FIT Python SDK](https://github.com/garmin/fit-python-sdk). To move to a new version:
 
 ```sh
 git clone --depth 1 https://github.com/garmin/fit-python-sdk /tmp/fit-python-sdk
@@ -242,5 +168,8 @@ zig fmt src/profile_generated.zig
 zig build test --summary all
 ```
 
-Then review the diff. Renamed fields or changed units fail the snapshot
-tests; regenerate the snapshots as above once the change is intended.
+## Licenses
+
+`src/profile_generated.zig` is derived from the FIT SDK and covered by Garmin's FIT Protocol
+License. The files in `testdata/` come from
+[python-fitparse](https://github.com/dtcooper/python-fitparse) (MIT); see `testdata/README.md`.
