@@ -105,11 +105,14 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   global message number, field definitions, developer field definitions)
 - Splits developer fields out of each data message
   (`DataMessage.developer_fields_iterator()` → `DeveloperField`: developer
-  data index, field number and raw bytes). Their base type lives in a
-  field_description message (206), which fitz doesn't interpret yet; a
-  caller that has it calls `DeveloperField.field(base_type)` to get a
-  `Field` that decodes like any other, with the size checked against the
-  base type there
+  data index, field number and raw bytes), and reads each file's
+  field_description messages (206) as they come.
+  `parser.developer_field_descriptions.get(&developer)` returns the field's
+  `DeveloperFieldDescription` (base type, name, units, scale, offset), or
+  null when the file hasn't described it. `DeveloperField.field(base_type)`
+  then gives a `Field` that decodes like any other, with the size checked
+  against the base type there. A later description of the same field
+  replaces the earlier one, and each chained file starts with none
 - Parses data messages per the matching definition, and decodes each
   field's base type (`DataMessage.fields_iterator()` → `Field.element(i)`
   → `Value`: unsigned, signed, float, string or bytes). Numeric fields
@@ -150,9 +153,11 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 - Strict on compressed timestamps: a compressed header before any full
   timestamp, one whose definition also has field 253, or one that would
   overflow `u32` is an error, where the FIT SDK assumes a reference of 0
-- Developer fields stay raw bytes: field_description (206) and
-  developer_data_id (207) messages are parsed like any other message, but
-  not used to name, type or scale developer fields
+- Strict on field_description messages: one without its developer data
+  index, field number or base type, or with a field of the wrong type, is
+  an error (`InvalidFieldDescription`). Its array, components, accumulate
+  and native-field entries aren't used, and developer_data_id (207) is
+  parsed like any other message
 - Strict on CRCs, with no opt-out: a mismatched header or file CRC, or a
   missing file CRC, rejects the whole file, so a damaged file can't be
   partially read
@@ -161,8 +166,8 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 
 1. Decide whether to relax the base-type policy to the SDK's byte
    fallback for mis-sized fields (the Coros file above)
-2. Decode developer fields through their field_description messages
-   (name, base type, units, scale, offset)
+2. Generate the full profile from the FIT SDK (enum value names, and the
+   components and subfields it describes)
 
 ## Layout
 

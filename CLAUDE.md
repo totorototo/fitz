@@ -25,9 +25,11 @@ at a time, not all at once.
   (`Field.element` returns a typed `Value`, or null for the base type's invalid sentinel).
   Well-known messages and fields are named, scaled and given units by `profile.zig`.
   Developer field definitions are parsed and each data message's developer fields are split out
-  as raw bytes (`DeveloperField.field(base_type)` decodes one once the caller knows its type).
-- **Not yet supported**: the full FIT profile (enum value names), decoding developer fields
-  through field_description (206) messages.
+  as raw bytes. Each file's field_description (206) messages are collected in
+  `Parser.developer_field_descriptions` (base type, name, units, scale, offset), and
+  `DeveloperField.field(base_type)` decodes a field once its description is known.
+- **Not yet supported**: the full FIT profile (enum value names), a field_description's array,
+  components and native-field entries.
 - **Error policy**: `FitError` is for invalid external bytes. An `assert` is for parser invariants,
   so a failed assert means a bug in fitz, never a bad file.
 - **Targets Zig 0.16.0**: I/O needs an explicit `std.Io`, `main` takes `std.process.Init`,

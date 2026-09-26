@@ -12,7 +12,6 @@ const testing = std.testing;
 const fitz = @import("fitz");
 
 const record_message = 20;
-const field_description_message = 206;
 
 const Counts = struct {
     definition: u32 = 0,
@@ -42,52 +41,6 @@ fn counts_read(buffer: []const u8) !Counts {
     return counts;
 }
 
-/// The base type a field_description message (206) gives one developer field. It is found the
-/// way a caller of `DeveloperField.field` would find it: by reading the file's own descriptions.
-const Description = struct {
-    developer_data_index: u8,
-    field_number: u8,
-    base_type: fitz.BaseType,
-};
-
-const description_count_max = 64;
-
-const Descriptions = struct {
-    items: [description_count_max]Description = undefined,
-    count: u8 = 0,
-
-    /// Reads developer_data_index (0), field_definition_number (1) and fit_base_type_id (2).
-    fn add(self: *Descriptions, data: *const fitz.DataMessage) !void {
-        assert(data.global_message_number == field_description_message);
-        assert(self.count < description_count_max);
-        var description: Description = undefined;
-        var found: u8 = 0;
-        var iterator = data.fields_iterator();
-        while (iterator.next()) |field| {
-            if (field.field_definition_number > 2) continue;
-            const value = field.element(0).?.unsigned;
-            switch (field.field_definition_number) {
-                0 => description.developer_data_index = @intCast(value),
-                1 => description.field_number = @intCast(value),
-                2 => description.base_type = try fitz.BaseType.from_byte(@intCast(value)),
-                else => unreachable,
-            }
-            found += 1;
-        }
-        try testing.expectEqual(@as(u8, 3), found);
-        self.items[self.count] = description;
-        self.count += 1;
-    }
-
-    fn base_type(self: *const Descriptions, field: *const fitz.DeveloperField) ?fitz.BaseType {
-        for (self.items[0..self.count]) |description| {
-            if (description.developer_data_index == field.developer_data_index and
-                description.field_number == field.field_number) return description.base_type;
-        }
-        return null;
-    }
-};
-
 test "DeveloperData.fit: developer fields decode through their field_description" {
     const buffer = @embedFile("DeveloperData.fit");
     const counts = try counts_read(buffer);
@@ -95,7 +48,6 @@ test "DeveloperData.fit: developer fields decode through their field_description
 
     var parser = try fitz.Parser.init(testing.allocator, buffer);
     defer parser.deinit();
-    var descriptions = Descriptions{};
     const heart_rates = [_]u64{ 140, 143, 144 };
     var records: u8 = 0;
     while (try parser.next()) |record| {
@@ -103,16 +55,17 @@ test "DeveloperData.fit: developer fields decode through their field_description
             .definition => continue,
             .data => |data| data,
         };
-        if (data.global_message_number == field_description_message) try descriptions.add(&data);
         if (data.global_message_number != record_message) continue;
 
-        // The file's description says "doughnuts_earned", sint8; the three records count 1-3.
+        // The file describes "doughnuts_earned", sint8, in "doughnuts"; the records count 1-3.
         var iterator = data.developer_fields_iterator();
         const developer = iterator.next().?;
         try testing.expectEqual(@as(?fitz.DeveloperField, null), iterator.next());
-        const base_type = descriptions.base_type(&developer).?;
-        try testing.expectEqual(fitz.BaseType.sint8, base_type);
-        const doughnuts = try developer.field(base_type);
+        const description = parser.developer_field_descriptions.get(&developer).?;
+        try testing.expectEqualStrings("doughnuts_earned", description.name.?);
+        try testing.expectEqualStrings("doughnuts", description.units);
+        try testing.expectEqual(fitz.BaseType.sint8, description.base_type);
+        const doughnuts = try developer.field(description.base_type);
         try testing.expectEqual(fitz.Value{ .signed = records + 1 }, doughnuts.element(0).?);
 
         var standard = data.fields_iterator();
@@ -123,6 +76,7 @@ test "DeveloperData.fit: developer fields decode through their field_description
         records += 1;
     }
     try testing.expectEqual(@as(u8, 3), records);
+    try testing.expectEqual(@as(u32, 1), parser.developer_field_descriptions.count());
 }
 
 test "20170518-191602-1740899583.fit: every developer field fits its described base type" {
@@ -133,18 +87,19 @@ test "20170518-191602-1740899583.fit: every developer field fits its described b
 
     var parser = try fitz.Parser.init(testing.allocator, buffer);
     defer parser.deinit();
-    var descriptions = Descriptions{};
     var values: u32 = 0;
     while (try parser.next()) |record| {
         const data = switch (record) {
             .definition => continue,
             .data => |data| data,
         };
-        if (data.global_message_number == field_description_message) try descriptions.add(&data);
         var iterator = data.developer_fields_iterator();
         while (iterator.next()) |developer| {
-            // `field` fails with InvalidFieldSize if the size doesn't fit the described type.
-            const field = try developer.field(descriptions.base_type(&developer).?);
+            // Every developer field is described before use, with a name. `field` fails with
+            // InvalidFieldSize if the size doesn't fit the described type.
+            const description = parser.developer_field_descriptions.get(&developer).?;
+            try testing.expect(description.name != null);
+            const field = try developer.field(description.base_type);
             try testing.expect(field.element_count() >= 1);
             values += 1;
         }

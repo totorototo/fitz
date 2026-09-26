@@ -8,8 +8,9 @@
 //! timestamp reconstructed), definition messages, and data messages with base-type
 //! value decoding. Chained FIT files in one buffer are read in turn. Every file's header
 //! CRC (when present) and file CRC are verified up front. Developer fields are split out of
-//! each data message as raw bytes; their base types live in field_description messages, which
-//! this file doesn't interpret. Names and scaling live in profile.zig.
+//! each data message as raw bytes, and each file's field_description messages are collected so
+//! a caller can look up a developer field's base type, name, units and scale. Names and scaling
+//! of standard fields live in profile.zig.
 //!
 //! Errors are for invalid external bytes; assertions are for invariants
 //! the parser itself guarantees. A failed assertion is a bug in this file.
@@ -36,6 +37,9 @@ pub const FitError = error{
     CompressedTimestampWithTimestampField,
     /// Reconstructing a compressed timestamp would pass the largest u32 timestamp.
     TimestampOverflow,
+    /// A field_description message (206) lacks its developer data index, field number or base
+    /// type, or holds a field of the wrong type or size, or a zero scale.
+    InvalidFieldDescription,
     OutOfMemory,
 };
 
@@ -435,6 +439,172 @@ pub const DeveloperField = struct {
     }
 };
 
+/// Global message number of field_description, which gives a developer field its base type,
+/// name, units, scale and offset.
+pub const field_description_message: u16 = 206;
+
+/// The field_description fields fitz reads. The others (array, components, bits, accumulate,
+/// base unit, native message and field numbers) are ignored.
+const FieldDescriptionField = enum(u8) {
+    developer_data_index = 0,
+    field_definition_number = 1,
+    fit_base_type_id = 2,
+    field_name = 3,
+    scale = 6,
+    offset = 7,
+    units = 8,
+    _,
+};
+
+/// What a field_description message (206) says about one developer field. The strings are
+/// views into the input buffer.
+pub const DeveloperFieldDescription = struct {
+    developer_data_index: u8,
+    field_number: u8,
+    base_type: BaseType,
+    /// As the file writes it, which is often not snake_case ("Heart Rate"). Null when absent.
+    name: ?[]const u8 = null,
+    /// Empty when absent.
+    units: []const u8 = "",
+    /// Nonzero. As for a profile field, physical value = raw / scale - offset.
+    scale: u8 = 1,
+    offset: i8 = 0,
+};
+
+/// Reads a field_description message. Fields 0-2 (which developer field, and its base type)
+/// are required; the rest default to an unnamed, unitless, unscaled field when absent or when
+/// they hold the invalid sentinel.
+fn parse_developer_field_description(
+    data: *const DataMessage,
+) FitError!DeveloperFieldDescription {
+    assert(data.global_message_number == field_description_message);
+    var developer_data_index: ?u8 = null;
+    var field_number: ?u8 = null;
+    var base_type_byte: ?u8 = null;
+    var description = DeveloperFieldDescription{
+        .developer_data_index = undefined,
+        .field_number = undefined,
+        .base_type = undefined,
+    };
+    var iterator = data.fields_iterator();
+    // Bounded by the definition's field count, at most 255.
+    while (iterator.next()) |field| {
+        switch (@as(FieldDescriptionField, @enumFromInt(field.field_definition_number))) {
+            .developer_data_index => developer_data_index = try description_unsigned(&field),
+            .field_definition_number => field_number = try description_unsigned(&field),
+            .fit_base_type_id => base_type_byte = try description_unsigned(&field),
+            .field_name => description.name = try description_string(&field),
+            .units => description.units = try description_string(&field) orelse "",
+            .scale => description.scale = try description_unsigned(&field) orelse 1,
+            .offset => description.offset = try description_signed(&field) orelse 0,
+            _ => {},
+        }
+    }
+    description.developer_data_index = developer_data_index orelse
+        return FitError.InvalidFieldDescription;
+    description.field_number = field_number orelse return FitError.InvalidFieldDescription;
+    const byte = base_type_byte orelse return FitError.InvalidFieldDescription;
+    description.base_type = try BaseType.from_byte(byte);
+    // A zero scale would divide by zero when the field is scaled.
+    if (description.scale == 0) return FitError.InvalidFieldDescription;
+
+    assert(description.scale >= 1);
+    assert(description.name == null or description.name.?.len >= 1);
+    return description;
+}
+
+/// One uint8 of a field_description, or null for the invalid sentinel. The file is wrong if
+/// the field is an array, isn't unsigned, or holds a value above 255.
+fn description_unsigned(field: *const Field) FitError!?u8 {
+    assert(field.raw.len >= 1);
+    if (field.element_count() != 1) return FitError.InvalidFieldDescription;
+    const value = field.element(0) orelse return null;
+    const unsigned = switch (value) {
+        .unsigned => |unsigned| unsigned,
+        .signed, .float, .string, .bytes => return FitError.InvalidFieldDescription,
+    };
+    const result = std.math.cast(u8, unsigned) orelse return FitError.InvalidFieldDescription;
+    assert(result == unsigned);
+    return result;
+}
+
+/// One sint8 of a field_description (the offset), or null for the invalid sentinel.
+fn description_signed(field: *const Field) FitError!?i8 {
+    assert(field.raw.len >= 1);
+    if (field.element_count() != 1) return FitError.InvalidFieldDescription;
+    const value = field.element(0) orelse return null;
+    const signed = switch (value) {
+        .signed => |signed| signed,
+        .unsigned, .float, .string, .bytes => return FitError.InvalidFieldDescription,
+    };
+    const result = std.math.cast(i8, signed) orelse return FitError.InvalidFieldDescription;
+    assert(result == signed);
+    return result;
+}
+
+/// A string of a field_description, or null when it is empty.
+fn description_string(field: *const Field) FitError!?[]const u8 {
+    assert(field.raw.len >= 1);
+    if (field.base_type != .string) return FitError.InvalidFieldDescription;
+    const value = field.element(0) orelse return null;
+    assert(value.string.len >= 1);
+    return value.string;
+}
+
+/// The descriptions read so far in the current file, keyed by developer data index and field
+/// number. A later description of the same field replaces the earlier one. At most 65,536
+/// entries, one per key.
+pub const DeveloperFieldDescriptions = struct {
+    map: std.AutoHashMapUnmanaged(u16, DeveloperFieldDescription) = .empty,
+
+    /// The description of `field`, or null when its file hasn't described it (yet).
+    pub fn get(
+        self: *const DeveloperFieldDescriptions,
+        field: *const DeveloperField,
+    ) ?DeveloperFieldDescription {
+        const description = self.map.get(key(field.developer_data_index, field.field_number)) orelse
+            return null;
+        assert(description.developer_data_index == field.developer_data_index);
+        assert(description.field_number == field.field_number);
+        return description;
+    }
+
+    pub fn put(
+        self: *DeveloperFieldDescriptions,
+        allocator: std.mem.Allocator,
+        description: DeveloperFieldDescription,
+    ) error{OutOfMemory}!void {
+        assert(description.scale >= 1);
+        const description_key = key(description.developer_data_index, description.field_number);
+        try self.map.put(allocator, description_key, description);
+        assert(self.map.count() >= 1);
+        assert(self.map.count() <= std.math.maxInt(u16) + 1);
+    }
+
+    pub fn count(self: *const DeveloperFieldDescriptions) u32 {
+        const result = self.map.count();
+        assert(result <= std.math.maxInt(u16) + 1);
+        return result;
+    }
+
+    /// Only for tables built outside a Parser, whose own table lives in its arena.
+    pub fn deinit(self: *DeveloperFieldDescriptions, allocator: std.mem.Allocator) void {
+        self.map.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn clear(self: *DeveloperFieldDescriptions) void {
+        self.map.clearRetainingCapacity();
+        assert(self.map.count() == 0);
+    }
+
+    fn key(developer_data_index: u8, field_number: u8) u16 {
+        const result = @as(u16, developer_data_index) << 8 | field_number;
+        assert(result >> 8 == developer_data_index);
+        return result;
+    }
+};
+
 /// Walks a data message's fields in definition order. It copies the slices out of the
 /// DataMessage, so it stays valid even if that DataMessage was a temporary.
 pub const FieldIterator = struct {
@@ -630,18 +800,20 @@ pub const Record = union(enum) {
     data: DataMessage,
 };
 
-/// Reads every FIT file chained in the buffer, in order. `header`, `file_crc` and `file_index`
-/// describe the file the latest record came from. Each file starts with no definitions and no
-/// timestamp reference, as a separate file would.
+/// Reads every FIT file chained in the buffer, in order. `header`, `file_crc`, `file_index` and
+/// `developer_field_descriptions` describe the file the latest record came from. Each file
+/// starts with no definitions, no timestamp reference and no descriptions, as a separate file
+/// would.
 ///
 /// A record's slices point into the buffer or into the parser's arena, so they stay valid until
 /// `deinit`, across redefinitions and files.
 /// After `next` returns an error the parser's position is unspecified;
 /// stop iterating and call `deinit`.
 pub const Parser = struct {
-    /// Holds every definition's field tables until `deinit`. Nothing is freed on redefinition,
-    /// so records stay valid; the total stays bounded because each definition allocates at
-    /// most the 3 bytes per field definition it consumed from the buffer.
+    /// Holds every definition's field tables and the descriptions table until `deinit`. Nothing
+    /// is freed on redefinition, so records stay valid. The total stays bounded: each definition
+    /// allocates at most the 3 bytes per field definition it consumed from the buffer, and the
+    /// descriptions table has at most 65,536 entries, reused across files.
     arena: std.heap.ArenaAllocator,
     buffer: []const u8,
     position: usize,
@@ -658,6 +830,10 @@ pub const Parser = struct {
     /// The latest full timestamp, from field 253 of a normal message or from a reconstructed
     /// compressed one. Compressed headers are resolved against it.
     timestamp_reference: ?u32 = null,
+    /// The current file's field_description messages, read so far. Look up a developer field of
+    /// the record `next` just returned; a later description, or the next file, can change the
+    /// answer.
+    developer_field_descriptions: DeveloperFieldDescriptions = .{},
 
     pub fn init(allocator: std.mem.Allocator, buffer: []const u8) FitError!Parser {
         // Verifying every file before the first record means no record is ever returned from a
@@ -706,6 +882,7 @@ pub const Parser = struct {
         assert(self.file_index + 1 < self.file_count);
         self.definitions = .{null} ** local_message_type_count;
         self.timestamp_reference = null;
+        self.developer_field_descriptions.clear();
         self.file_index += 1;
         self.file_load(self.end + crc_size);
         self.assert_invariants();
@@ -864,7 +1041,7 @@ pub const Parser = struct {
         assert(raw.len + developer_raw.len == size);
         assert(raw.ptr + raw.len == developer_raw.ptr);
         assert((compressed_timestamp != null) == (time_offset != null));
-        return Record{ .data = DataMessage{
+        const data = DataMessage{
             .local_message_type = local_message_type,
             .global_message_number = definition.global_message_number,
             .big_endian = definition.big_endian,
@@ -873,7 +1050,12 @@ pub const Parser = struct {
             .raw = raw,
             .developer_fields = definition.developer_fields,
             .developer_raw = developer_raw,
-        } };
+        };
+        if (data.global_message_number == field_description_message) {
+            const description = try parse_developer_field_description(&data);
+            try self.developer_field_descriptions.put(self.arena.allocator(), description);
+        }
+        return Record{ .data = data };
     }
 };
 
@@ -1864,4 +2046,219 @@ test "DeveloperField.field: the size must fit the described base type" {
     try testing.expectEqual(@as(u8, 1), (try developer.field(.byte)).element_count());
     developer.raw = bytes_max[0..1];
     try testing.expectError(FitError.InvalidFieldSize, developer.field(.sint16));
+}
+
+/// Reads a field_description built from `fields` and their little-endian `raw` bytes.
+fn test_description_parse(
+    fields: []const FieldDefinition,
+    raw: []const u8,
+) FitError!DeveloperFieldDescription {
+    const data = DataMessage{
+        .local_message_type = 0,
+        .global_message_number = field_description_message,
+        .big_endian = false,
+        .compressed_timestamp = null,
+        .fields = fields,
+        .raw = raw,
+        .developer_fields = &.{},
+        .developer_raw = &.{},
+    };
+    return parse_developer_field_description(&data);
+}
+
+fn test_field(number: u8, size: u8, base_type: BaseType) FieldDefinition {
+    return .{ .field_definition_number = number, .size = size, .base_type = base_type };
+}
+
+/// Developer data index, field number and base type, each a uint8.
+const test_description_required = [_]FieldDefinition{
+    test_field(0, 1, .uint8), test_field(1, 1, .uint8), test_field(2, 1, .uint8),
+};
+
+test "parse_developer_field_description: every field read, the others ignored" {
+    const fields = test_description_required ++ [_]FieldDefinition{
+        test_field(3, 8, .string), test_field(6, 1, .uint8),  test_field(7, 1, .sint8),
+        test_field(8, 4, .string), test_field(15, 1, .uint8), test_field(4, 1, .uint8),
+    };
+    // 254 is the largest index: 255 is the uint8 invalid sentinel, so it means "absent".
+    const raw = [_]u8{ 254, 7, 0x84 } ++ "Power\x00\x00\x00".* ++ [_]u8{ 10, 0xFB } ++
+        "W\x00\x00\x00".* ++ [_]u8{ 3, 1 };
+    const description = try test_description_parse(&fields, &raw);
+    try testing.expectEqual(@as(u8, 254), description.developer_data_index);
+    try testing.expectEqual(@as(u8, 7), description.field_number);
+    try testing.expectEqual(BaseType.uint16, description.base_type);
+    try testing.expectEqualStrings("Power", description.name.?);
+    try testing.expectEqualStrings("W", description.units);
+    try testing.expectEqual(@as(u8, 10), description.scale);
+    try testing.expectEqual(@as(i8, -5), description.offset);
+}
+
+test "parse_developer_field_description: absent or invalid optional fields take defaults" {
+    const minimal = try test_description_parse(&test_description_required, &.{ 0, 0, 0x07 });
+    try testing.expectEqual(DeveloperFieldDescription{
+        .developer_data_index = 0,
+        .field_number = 0,
+        .base_type = .string,
+    }, minimal);
+
+    const fields = test_description_required ++ [_]FieldDefinition{
+        test_field(3, 2, .string), test_field(6, 1, .uint8),
+        test_field(7, 1, .sint8),  test_field(8, 1, .string),
+    };
+    const sentinels = try test_description_parse(&fields, &.{ 0, 0, 0x07, 0, 'x', 0xFF, 0x7F, 0 });
+    try testing.expectEqual(minimal, sentinels);
+}
+
+test "parse_developer_field_description: rejects a description it can't use" {
+    const required = &test_description_required;
+    const u8_scale = [_]FieldDefinition{test_field(6, 1, .uint8)};
+    const u8_name = [_]FieldDefinition{test_field(3, 1, .uint8)};
+    const u8_offset = [_]FieldDefinition{test_field(7, 1, .uint8)};
+    const sint8_index = test_field(0, 1, .sint8);
+    const uint16_number = test_field(1, 2, .uint16);
+    const array_number = test_field(1, 2, .uint8);
+    const Case = struct { fields: []const FieldDefinition, raw: []const u8 };
+    const cases = [_]Case{
+        // Each required field missing in turn, or holding its invalid sentinel.
+        .{ .fields = required[1..], .raw = &.{ 0, 0x02 } },
+        .{ .fields = &.{ required[0], required[2] }, .raw = &.{ 0, 0x02 } },
+        .{ .fields = required[0..2], .raw = &.{ 0, 0 } },
+        .{ .fields = required, .raw = &.{ 0xFF, 0, 0x02 } },
+        .{ .fields = required, .raw = &.{ 0, 0, 0xFF } },
+        // Zero scale.
+        .{ .fields = required ++ &u8_scale, .raw = &.{ 0, 0, 0x02, 0 } },
+        // A name that isn't a string, an offset that isn't signed, an index that is.
+        .{ .fields = required ++ &u8_name, .raw = &.{ 0, 0, 0x02, 1 } },
+        .{ .fields = required ++ &u8_offset, .raw = &.{ 0, 0, 0x02, 1 } },
+        .{ .fields = &.{ sint8_index, required[1], required[2] }, .raw = &.{ 0, 0, 2 } },
+        // A field number of 256, or given as an array.
+        .{ .fields = &.{ required[0], uint16_number, required[2] }, .raw = &.{ 0, 0, 1, 2 } },
+        .{ .fields = &.{ required[0], array_number, required[2] }, .raw = &.{ 0, 1, 1, 2 } },
+    };
+    for (cases) |case| {
+        const result = test_description_parse(case.fields, case.raw);
+        try testing.expectError(FitError.InvalidFieldDescription, result);
+    }
+    // A base type byte that isn't canonical.
+    const uint16_without_flag = test_description_parse(required, &.{ 0, 0, 0x04 });
+    try testing.expectError(FitError.InvalidBaseType, uint16_without_flag);
+    // A uint16 field number of 255 fits a u8: the boundary below the one rejected above.
+    const wide = [_]FieldDefinition{ required[0], uint16_number, required[2] };
+    const description = try test_description_parse(&wide, &.{ 0, 255, 0, 0x02 });
+    try testing.expectEqual(@as(u8, 255), description.field_number);
+}
+
+/// Local type 0 as field_description: developer data index, field number, base type, then a
+/// 4-byte name.
+const test_definition_local_0_description = [_]u8{
+    0x40, 0, 0, 206, 0, 4, 0, 1, 0x02, 1, 1, 0x02, 2, 1, 0x02, 3, 4, 0x07,
+};
+
+test "Parser: developer fields are looked up in the file's field_description messages" {
+    const file = try test_file_build(testing.allocator, &test_definition_local_0_description ++
+        test_definition_local_3_developer ++
+        [_]u8{ 0x03, 150, 0x34, 0x12, 0xFF, 0xFF, 0xFF, 0xFF } ++ // Before the description.
+        [_]u8{ 0x00, 0, 1, 0x84, 'r', 'p', 'm', 0 } ++ // Index 0, field 1: uint16 "rpm".
+        [_]u8{ 0x03, 150, 0x34, 0x12, 0xFF, 0xFF, 0xFF, 0xFF } ++
+        [_]u8{ 0x00, 0, 1, 0x02, 'r', 0, 0, 0 } ++ // Described again: uint8 "r".
+        [_]u8{ 0x03, 150, 0x34, 0x12, 0xFF, 0xFF, 0xFF, 0xFF });
+    defer testing.allocator.free(file);
+
+    var parser = try Parser.init(testing.allocator, file);
+    defer parser.deinit();
+    const descriptions = &parser.developer_field_descriptions;
+    _ = (try parser.next()).?.definition;
+    _ = (try parser.next()).?.definition;
+    var data = (try parser.next()).?.data;
+    var iterator = data.developer_fields_iterator();
+    try testing.expectEqual(null, descriptions.get(&iterator.next().?));
+
+    _ = (try parser.next()).?.data;
+    try testing.expectEqual(@as(u32, 1), descriptions.count());
+    data = (try parser.next()).?.data;
+    iterator = data.developer_fields_iterator();
+    const developer = iterator.next().?;
+    const description = descriptions.get(&developer).?;
+    try testing.expectEqualStrings("rpm", description.name.?);
+    const field = try developer.field(description.base_type);
+    try testing.expectEqual(Value{ .unsigned = 0x1234 }, field.element(0).?);
+    // Index 1, field 253 was never described.
+    try testing.expectEqual(null, descriptions.get(&iterator.next().?));
+
+    _ = (try parser.next()).?.data;
+    try testing.expectEqual(@as(u32, 1), descriptions.count());
+    data = (try parser.next()).?.data;
+    iterator = data.developer_fields_iterator();
+    const replaced = descriptions.get(&iterator.next().?).?;
+    try testing.expectEqual(BaseType.uint8, replaced.base_type);
+    try testing.expectEqualStrings("r", replaced.name.?);
+    try testing.expectEqual(@as(?Record, null), try parser.next());
+}
+
+test "Parser: a chained file doesn't inherit developer field descriptions" {
+    const buffer = try test_files_chain(testing.allocator, &.{
+        &test_definition_local_0_description ++ [_]u8{ 0x00, 0, 1, 0x84, 'r', 0, 0, 0 },
+        &test_definition_local_3_developer ++ [_]u8{ 0x03, 150, 0x34, 0x12, 1, 2, 3, 4 },
+    });
+    defer testing.allocator.free(buffer);
+
+    var parser = try Parser.init(testing.allocator, buffer);
+    defer parser.deinit();
+    _ = (try parser.next()).?.definition;
+    _ = (try parser.next()).?.data;
+    try testing.expectEqual(@as(u32, 1), parser.developer_field_descriptions.count());
+    _ = (try parser.next()).?.definition;
+    const data = (try parser.next()).?.data;
+    try testing.expectEqual(@as(u32, 1), parser.file_index);
+    try testing.expectEqual(@as(u32, 0), parser.developer_field_descriptions.count());
+    var iterator = data.developer_fields_iterator();
+    const developer = iterator.next().?;
+    const description = parser.developer_field_descriptions.get(&developer);
+    try testing.expectEqual(@as(?DeveloperFieldDescription, null), description);
+}
+
+test "Parser: a field_description without a base type fails the record" {
+    // Local type 0 as field_description with only fields 0 and 1.
+    const file = try test_file_build(testing.allocator, &[_]u8{
+        0x40, 0, 0, 206, 0, 2, 0, 1, 0x02, 1, 1, 0x02, 0x00, 0, 1,
+    });
+    defer testing.allocator.free(file);
+
+    var parser = try Parser.init(testing.allocator, file);
+    defer parser.deinit();
+    _ = (try parser.next()).?.definition;
+    try testing.expectError(FitError.InvalidFieldDescription, parser.next());
+    try testing.expectEqual(@as(u32, 0), parser.developer_field_descriptions.count());
+}
+
+test "DeveloperFieldDescriptions: keys by developer data index and field number" {
+    var descriptions = DeveloperFieldDescriptions{};
+    defer descriptions.deinit(testing.allocator);
+    const corners = [_][2]u8{ .{ 0, 0 }, .{ 0, 255 }, .{ 255, 0 }, .{ 255, 255 } };
+    for (corners) |corner| {
+        try descriptions.put(testing.allocator, .{
+            .developer_data_index = corner[0],
+            .field_number = corner[1],
+            .base_type = .uint8,
+        });
+    }
+    try testing.expectEqual(@as(u32, 4), descriptions.count());
+    for (corners) |corner| {
+        const developer = DeveloperField{
+            .developer_data_index = corner[0],
+            .field_number = corner[1],
+            .endian = .little,
+            .raw = &.{0},
+        };
+        try testing.expect(descriptions.get(&developer) != null);
+    }
+    const other = DeveloperField{
+        .developer_data_index = 1,
+        .field_number = 0,
+        .endian = .little,
+        .raw = &.{0},
+    };
+    try testing.expectEqual(@as(?DeveloperFieldDescription, null), descriptions.get(&other));
+    descriptions.clear();
+    try testing.expectEqual(@as(u32, 0), descriptions.count());
 }
