@@ -7,11 +7,11 @@ const file_size_max = 64 * 1024 * 1024;
 
 const usage =
     \\usage: fitz [--dump [--all]] <file.fit>
-    \\  --dump  print each data message to stdout, one line per message, showing the fields
-    \\          the built-in profile knows and that hold data: named, scaled, with units,
-    \\          dates in ISO 8601 and positions in degrees
-    \\  --all   with --dump, print every field instead: "no data" as -, unknown fields by
-    \\          number, and dates and positions as stored (seconds, semicircles)
+    \\  --dump  print each data message to stdout as a block, one field per line: the
+    \\          fields the built-in profile knows and that hold data, named, scaled, with
+    \\          units, dates in ISO 8601 and positions in degrees
+    \\  --all   with --dump, print one line per message with every field instead: "no data"
+    \\          as -, unknown fields by number, dates and positions as stored
     \\  via build: zig build run -- [--dump [--all]] <file.fit>
     \\
 ;
@@ -211,29 +211,83 @@ fn counts_print(
     );
 }
 
-/// One line per data message: `DATA local=L global_msg=G field=value ...`. In readable
-/// detail, only fields the profile knows and that hold at least one value are printed.
+/// Readable detail prints a block per message; full detail prints one line per message, so
+/// the full dump stays easy to grep and to process line by line.
 fn data_message_write(
     writer: *std.Io.Writer,
     data: *const fitz.DataMessage,
     detail: DumpDetail,
 ) !void {
+    switch (detail) {
+        .readable => try data_message_block_write(writer, data),
+        .all => try data_message_line_write(writer, data),
+    }
+}
+
+/// Every name in the profile fits this column, which a test checks, so values line up.
+const name_column_width = 22;
+
+/// A heading with the message name, then one indented `name  value units` line per field
+/// the profile knows and that holds data, then a blank line. A message with nothing to show
+/// is skipped entirely; the summary still counts it.
+fn data_message_block_write(writer: *std.Io.Writer, data: *const fitz.DataMessage) !void {
+    var fields_shown: usize = 0;
+    var iterator = data.fields_iterator();
+    // Bounded by the definition's field count, at most 255.
+    while (iterator.next()) |field| {
+        if (field_is_readable(&field, data.global_message_number)) fields_shown += 1;
+    }
+    assert(fields_shown <= data.fields.len);
+    if (fields_shown == 0 and data.compressed_timestamp == null) return;
+
+    const label = MessageLabel{ .global_message_number = data.global_message_number };
+    try writer.print("{f}\n", .{label});
+    // A compressed header's timestamp isn't one of the message's fields, so it is printed
+    // first, where a normal message's field 253 usually is.
+    if (data.compressed_timestamp) |timestamp| {
+        try writer.print("  {s:<[1]}", .{ "timestamp", name_column_width });
+        try date_time_write(writer, timestamp, .utc);
+        try writer.writeByte('\n');
+    }
+
+    var fields_written: usize = 0;
+    iterator = data.fields_iterator();
+    while (iterator.next()) |field| {
+        if (!field_is_readable(&field, data.global_message_number)) continue;
+        const profile = fitz.profile.field_profile(
+            data.global_message_number,
+            field.field_definition_number,
+        ).?;
+        assert(profile.name.len < name_column_width);
+        try writer.print("  {s:<[1]}", .{ profile.name, name_column_width });
+        try field_value_write(writer, &field, &profile, .readable);
+        try writer.writeByte('\n');
+        fields_written += 1;
+    }
+    assert(fields_written == fields_shown);
+    try writer.writeByte('\n');
+}
+
+/// Readable detail shows a field only when the profile knows it and it holds data.
+fn field_is_readable(field: *const fitz.Field, global_message_number: u16) bool {
+    const known = fitz.profile.field_profile(
+        global_message_number,
+        field.field_definition_number,
+    ) != null;
+    return known and field_has_data(field);
+}
+
+/// `DATA local=L global_msg=G field=value ...` with every field, as stored.
+fn data_message_line_write(writer: *std.Io.Writer, data: *const fitz.DataMessage) !void {
     try writer.print("DATA local={d} global_msg={f}", .{
         data.local_message_type,
         MessageLabel{ .global_message_number = data.global_message_number },
     });
     // A compressed header's timestamp isn't one of the message's fields, so it is printed
     // first, the way a normal message's field 253 would be.
-    if (data.compressed_timestamp) |timestamp| {
-        try writer.writeAll(" timestamp=");
-        switch (detail) {
-            .readable => try date_time_write(writer, timestamp, .utc),
-            .all => try writer.print("{d}s", .{timestamp}),
-        }
-    }
+    if (data.compressed_timestamp) |timestamp| try writer.print(" timestamp={d}s", .{timestamp});
 
     var fields_written: usize = 0;
-    var fields_skipped: usize = 0;
     var iterator = data.fields_iterator();
     // Bounded by the definition's field count, at most 255.
     while (iterator.next()) |field| {
@@ -241,20 +295,18 @@ fn data_message_write(
             data.global_message_number,
             field.field_definition_number,
         );
-        const shown = switch (detail) {
-            .readable => field_profile != null and field_has_data(&field),
-            .all => true,
-        };
-        if (!shown) {
-            fields_skipped += 1;
-            continue;
-        }
         try writer.writeByte(' ');
-        try field_write(writer, &field, if (field_profile) |*profile| profile else null, detail);
+        if (field_profile) |profile| {
+            try writer.writeAll(profile.name);
+        } else {
+            try writer.print("{d}", .{field.field_definition_number});
+        }
+        try writer.writeByte('=');
+        const profile_pointer = if (field_profile) |*profile| profile else null;
+        try field_value_write(writer, &field, profile_pointer, .all);
         fields_written += 1;
     }
-    assert(fields_written + fields_skipped == data.fields.len);
-    assert(detail == .readable or fields_skipped == 0);
+    assert(fields_written == data.fields.len);
     try writer.writeByte('\n');
 }
 
@@ -269,9 +321,10 @@ fn field_has_data(field: *const fitz.Field) bool {
     return false;
 }
 
-/// `name=value` for a single element, `name=[a,b,...]` for an array, followed by the units.
-/// A field the profile doesn't know is printed by number, raw and without units.
-fn field_write(
+/// The value for a single element, `[a,b,...]` for an array, then the units: appended
+/// directly in full detail (`157bpm`), after a space in readable detail (`157 bpm`). A field
+/// the profile doesn't know is printed raw and without units.
+fn field_value_write(
     writer: *std.Io.Writer,
     field: *const fitz.Field,
     field_profile: ?*const fitz.profile.FieldProfile,
@@ -279,13 +332,6 @@ fn field_write(
 ) !void {
     const element_count = field.element_count();
     assert(element_count >= 1);
-
-    if (field_profile) |profile| {
-        try writer.writeAll(profile.name);
-    } else {
-        try writer.print("{d}", .{field.field_definition_number});
-    }
-    try writer.writeByte('=');
 
     if (element_count == 1) {
         // A single "no data" value gets no units: `heart_rate=-`, not `heart_rate=-bpm`.
@@ -300,9 +346,15 @@ fn field_write(
         }
         try writer.writeByte(']');
     }
-    // A converted date or position carries its own notation instead of the raw units.
+
     const profile = field_profile orelse return;
-    if (detail == .all or profile.kind == .number) try writer.writeAll(profile.units);
+    switch (detail) {
+        .all => try writer.writeAll(profile.units),
+        // A converted date or position carries its own notation instead of the raw units.
+        .readable => if (profile.kind == .number and profile.units.len > 0) {
+            try writer.print(" {s}", .{profile.units});
+        },
+    }
 }
 
 /// Invalid (sentinel) elements print as `-`, so "no data" never looks like a real number.
@@ -581,11 +633,15 @@ test "data_message_write: readable detail hides empty and unknown fields and con
     var writer = std.Io.Writer.fixed(&buffer);
     try data_message_write(&writer, &data, .readable);
     try testing.expectEqualStrings(
-        "DATA local=3 global_msg=record timestamp=2026-09-24T10:12:54Z " ++
-            "position_lat=45.026082° position_long=-0.808959° heart_rate=157bpm " ++
-            "enhanced_altitude=792m\n",
-        writer.buffered(),
-    );
+        \\record
+        \\  timestamp             2026-09-24T10:12:54Z
+        \\  position_lat          45.026082°
+        \\  position_long         -0.808959°
+        \\  heart_rate            157 bpm
+        \\  enhanced_altitude     792 m
+        \\
+        \\
+    , writer.buffered());
 
     // The same message in full detail keeps every field, raw dates and positions.
     writer = std.Io.Writer.fixed(&buffer);
@@ -611,9 +667,11 @@ test "data_message_write: a readable compressed timestamp is a date" {
     var writer = std.Io.Writer.fixed(&buffer);
     try data_message_write(&writer, &data, .readable);
     try testing.expectEqualStrings(
-        "DATA local=1 global_msg=325 timestamp=2026-09-24T10:12:54Z\n",
-        writer.buffered(),
-    );
+        \\325
+        \\  timestamp             2026-09-24T10:12:54Z
+        \\
+        \\
+    , writer.buffered());
 }
 
 test "field_has_data: all, some or none of the elements" {
@@ -671,4 +729,74 @@ test "converted_write: a base type that doesn't fit the kind falls back to raw" 
 
     try testing.expect(try converted_write(&writer, .{ .signed = 1 << 30 }, .semicircles));
     try testing.expectEqualStrings("90.000000°", writer.buffered());
+}
+
+test "data_message_write: a readable message with nothing to show is skipped" {
+    const fields = [_]fitz.FieldDefinition{
+        .{ .field_definition_number = 7, .size = 2, .base_type = .uint16 }, // power: no data
+        .{ .field_definition_number = 200, .size = 1, .base_type = .uint8 }, // unknown
+    };
+    const record = fitz.DataMessage{
+        .local_message_type = 0,
+        .global_message_number = 20,
+        .big_endian = false,
+        .compressed_timestamp = null,
+        .fields = &fields,
+        .raw = &.{ 0xFF, 0xFF, 42 },
+    };
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &record, .readable);
+    try testing.expectEqualStrings("", writer.buffered());
+
+    // In full detail the same message is still one line with every field.
+    try data_message_write(&writer, &record, .all);
+    const line = "DATA local=0 global_msg=record power=- 200=42\n";
+    try testing.expectEqualStrings(line, writer.buffered());
+}
+
+test "field_value_write: units follow a space in readable detail, but not in full detail" {
+    const pair = fitz.Field{
+        .field_definition_number = 5,
+        .base_type = .uint8,
+        .endian = .little,
+        .raw = &.{ 7, 0xFF },
+    };
+    const distance = fitz.profile.field_profile(20, 5).?;
+    var buffer: [64]u8 = undefined;
+
+    var writer = std.Io.Writer.fixed(&buffer);
+    try field_value_write(&writer, &pair, &distance, .readable);
+    try testing.expectEqualStrings("[0.07,-] m", writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try field_value_write(&writer, &pair, &distance, .all);
+    try testing.expectEqualStrings("[0.07,-]m", writer.buffered());
+
+    // A dimensionless field gets no trailing space.
+    const message_index = fitz.profile.field_profile(18, 254).?;
+    const index = fitz.Field{
+        .field_definition_number = 254,
+        .base_type = .uint16,
+        .endian = .little,
+        .raw = &.{ 0, 0 },
+    };
+    writer = std.Io.Writer.fixed(&buffer);
+    try field_value_write(&writer, &index, &message_index, .readable);
+    try testing.expectEqualStrings("0", writer.buffered());
+}
+
+test "name_column_width: every profile field name fits, leaving a gap" {
+    var message_number: u32 = 0;
+    // Bounded: the whole u16 message space times the whole u8 field space.
+    while (message_number <= std.math.maxInt(u16)) : (message_number += 1) {
+        const global: u16 = @intCast(message_number);
+        if (fitz.profile.message_name(global) == null) continue;
+        var field_number: u32 = 0;
+        while (field_number <= std.math.maxInt(u8)) : (field_number += 1) {
+            const profile = fitz.profile.field_profile(global, @intCast(field_number)) orelse
+                continue;
+            try testing.expect(profile.name.len < name_column_width);
+        }
+    }
 }

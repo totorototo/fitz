@@ -17,20 +17,30 @@ zig build run -- --dump --all path/to/file.fit > dump-all.txt
 ```
 
 Without flags the CLI prints the header and a per-message-type count
-summary to stderr. `--dump` also writes one line per data message to
-stdout, meant for reading:
+summary to stderr. `--dump` also writes each data message to stdout as a
+block meant for reading, one field per line, blocks separated by a blank
+line:
 
 ```
-DATA local=2 global_msg=record timestamp=2026-09-24T10:12:54Z position_lat=45.026082° position_long=-0.808959° enhanced_altitude=24.2m heart_rate=107bpm
+record
+  timestamp             2026-09-24T10:12:54Z
+  position_lat          45.026082°
+  position_long         -0.808959°
+  enhanced_altitude     24.2 m
+  heart_rate            107 bpm
 ```
 
 It shows only the fields the built-in profile knows and that hold data,
-as `name=value` plus units, with scale and offset applied. Dates are
+with scale and offset applied, and skips a message with nothing to show
+(the summary still counts it). To pull out one kind of message, use awk's
+paragraph mode: `awk -v RS= '/^session\n/' dump.txt`. Dates are
 ISO 8601: UTC with a `Z`, local time (`local_timestamp`) without one, and
 a date_time below `0x10000000` (seconds since the device powered on)
 stays in seconds. Positions are in degrees.
 
-`--dump --all` prints every field as stored, for debugging: `-` for a
+`--dump --all` prints one line per message, easy to grep, e.g.
+`DATA local=2 global_msg=record timestamp=1159179174s … power=- 140=0`.
+It shows every field as stored, for debugging: `-` for a
 base type's invalid ("no data") sentinel, unknown messages and fields by
 number, and dates and positions in raw seconds and semicircles. Scale and
 offset still apply. In both modes, arrays are in brackets, strings quoted
