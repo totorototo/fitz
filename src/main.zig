@@ -9,10 +9,12 @@ const usage =
     \\usage: fitz [--dump [--all]] <file.fit>
     \\  --dump  print each data message to stdout as a block, one field per line: the
     \\          fields the built-in profile knows and that hold data, named, scaled, with
-    \\          units, dates in ISO 8601 and positions in degrees
+    \\          units, dates in ISO 8601 and positions in degrees, then the developer
+    \\          fields the file describes by name
     \\  --all   with --dump, print one line per message with every field instead: "no data"
     \\          as -, unknown fields by number, dates and positions as stored, and
-    \\          developer fields as dev:<developer_data_index>:<field_number>=0x<bytes>
+    \\          developer fields as dev:<developer_data_index>:<field_number>=<value>, or
+    \\          =0x<bytes> when the file doesn't describe them
     \\  via build: zig build run -- [--dump [--all]] <file.fit>
     \\
 ;
@@ -241,7 +243,12 @@ fn records_process(
                 entry.value_ptr.* += 1;
                 if (data.compressed_timestamp != null) record_counts.compressed_timestamp += 1;
                 if (data.developer_fields.len > 0) record_counts.developer_fields += 1;
-                if (dump) |active| try data_message_write(active.writer, &data, active.detail);
+                if (dump) |active| try data_message_write(
+                    active.writer,
+                    &data,
+                    &parser.developer_field_descriptions,
+                    active.detail,
+                );
             },
         }
     }
@@ -281,14 +288,16 @@ fn counts_print(
 
 /// Readable detail prints a block per message; full detail prints one line per message, so
 /// the full dump stays easy to grep and to process line by line.
+/// `descriptions` are the developer field descriptions of the message's file, read so far.
 fn data_message_write(
     writer: *std.Io.Writer,
     data: *const fitz.DataMessage,
+    descriptions: *const fitz.DeveloperFieldDescriptions,
     detail: DumpDetail,
 ) !void {
     switch (detail) {
-        .readable => try data_message_block_write(writer, data),
-        .all => try data_message_line_write(writer, data),
+        .readable => try data_message_block_write(writer, data, descriptions),
+        .all => try data_message_line_write(writer, data, descriptions),
     }
 }
 
@@ -296,10 +305,14 @@ fn data_message_write(
 const name_column_width = 22;
 
 /// A heading with the message name, then one indented `name  value units` line per field
-/// the profile knows and that holds data, then a blank line. A message with nothing to show
-/// is skipped entirely; the summary still counts it. Developer fields are left out: without
-/// their field_description they have no name, type or units to show.
-fn data_message_block_write(writer: *std.Io.Writer, data: *const fitz.DataMessage) !void {
+/// the profile knows and that holds data, then the same for the developer fields the file
+/// describes by name, then a blank line. A message with nothing to show is skipped entirely;
+/// the summary still counts it.
+fn data_message_block_write(
+    writer: *std.Io.Writer,
+    data: *const fitz.DataMessage,
+    descriptions: *const fitz.DeveloperFieldDescriptions,
+) !void {
     var fields_shown: usize = 0;
     var iterator = data.fields_iterator();
     // Bounded by the definition's field count, at most 255.
@@ -307,7 +320,8 @@ fn data_message_block_write(writer: *std.Io.Writer, data: *const fitz.DataMessag
         if (field_is_readable(&field, data.global_message_number)) fields_shown += 1;
     }
     assert(fields_shown <= data.fields.len);
-    if (fields_shown == 0 and data.compressed_timestamp == null) return;
+    const developer_fields_shown = developer_fields_readable_count(data, descriptions);
+    if (fields_shown + developer_fields_shown == 0 and data.compressed_timestamp == null) return;
 
     const label = MessageLabel{ .global_message_number = data.global_message_number };
     try writer.print("{f}\n", .{label});
@@ -328,13 +342,93 @@ fn data_message_block_write(writer: *std.Io.Writer, data: *const fitz.DataMessag
             field.field_definition_number,
         ).?;
         assert(profile.name.len < name_column_width);
-        try writer.print("  {s:<[1]}", .{ profile.name, name_column_width });
+        try field_name_write(writer, profile.name);
         try field_value_write(writer, &field, &profile, .readable);
         try writer.writeByte('\n');
         fields_written += 1;
     }
     assert(fields_written == fields_shown);
+    try developer_fields_block_write(writer, data, descriptions, developer_fields_shown);
     try writer.writeByte('\n');
+}
+
+/// Pads the name to the value column. A developer field's name comes from the file and may be
+/// longer than the column, so it still gets one space.
+fn field_name_write(writer: *std.Io.Writer, name: []const u8) !void {
+    assert(name.len >= 1);
+    const width = @max(name_column_width, name.len + 1);
+    try writer.print("  {s:<[1]}", .{ name, width });
+}
+
+/// A developer field with its description, as a profile, and its bytes viewed as the described
+/// base type.
+const DeveloperFieldDecoded = struct {
+    field: fitz.Field,
+    profile: fitz.profile.FieldProfile,
+};
+
+/// Null when the file hasn't described the field, or described a base type its size doesn't
+/// fit. Either way the full dump shows the stored bytes instead.
+fn developer_field_decode(
+    developer: *const fitz.DeveloperField,
+    descriptions: *const fitz.DeveloperFieldDescriptions,
+) ?DeveloperFieldDecoded {
+    const description = descriptions.get(developer) orelse return null;
+    const field = developer.field(description.base_type) catch |err| switch (err) {
+        error.InvalidFieldSize => return null,
+        else => unreachable,
+    };
+    const decoded = DeveloperFieldDecoded{
+        .field = field,
+        .profile = fitz.profile.developer_field_profile(&description),
+    };
+    assert(decoded.field.raw.ptr == developer.raw.ptr);
+    return decoded;
+}
+
+/// Readable detail shows a developer field only when it decodes, has a name, and holds data.
+fn developer_field_readable(
+    developer: *const fitz.DeveloperField,
+    descriptions: *const fitz.DeveloperFieldDescriptions,
+) ?DeveloperFieldDecoded {
+    const decoded = developer_field_decode(developer, descriptions) orelse return null;
+    if (decoded.profile.name.len == 0) return null;
+    if (!field_has_data(&decoded.field)) return null;
+    return decoded;
+}
+
+fn developer_fields_readable_count(
+    data: *const fitz.DataMessage,
+    descriptions: *const fitz.DeveloperFieldDescriptions,
+) usize {
+    var count: usize = 0;
+    var iterator = data.developer_fields_iterator();
+    // Bounded by the definition's developer field count, at most 255.
+    while (iterator.next()) |developer| {
+        if (developer_field_readable(&developer, descriptions) != null) count += 1;
+    }
+    assert(count <= data.developer_fields.len);
+    return count;
+}
+
+fn developer_fields_block_write(
+    writer: *std.Io.Writer,
+    data: *const fitz.DataMessage,
+    descriptions: *const fitz.DeveloperFieldDescriptions,
+    fields_shown: usize,
+) !void {
+    assert(fields_shown <= data.developer_fields.len);
+    var fields_written: usize = 0;
+    var iterator = data.developer_fields_iterator();
+    // Bounded by the definition's developer field count, at most 255.
+    while (iterator.next()) |developer| {
+        const decoded = developer_field_readable(&developer, descriptions) orelse continue;
+        try field_name_write(writer, decoded.profile.name);
+        try field_value_write(writer, &decoded.field, &decoded.profile, .readable);
+        try writer.writeByte('\n');
+        fields_written += 1;
+    }
+    assert(fields_written == fields_shown);
 }
 
 /// Readable detail shows a field only when the profile knows it and it holds data.
@@ -347,7 +441,11 @@ fn field_is_readable(field: *const fitz.Field, global_message_number: u16) bool 
 }
 
 /// `DATA local=L global_msg=G field=value ... dev:I:N=0x...` with every field, as stored.
-fn data_message_line_write(writer: *std.Io.Writer, data: *const fitz.DataMessage) !void {
+fn data_message_line_write(
+    writer: *std.Io.Writer,
+    data: *const fitz.DataMessage,
+    descriptions: *const fitz.DeveloperFieldDescriptions,
+) !void {
     try writer.print("DATA local={d} global_msg={f}", .{
         data.local_message_type,
         MessageLabel{ .global_message_number = data.global_message_number },
@@ -376,24 +474,31 @@ fn data_message_line_write(writer: *std.Io.Writer, data: *const fitz.DataMessage
         fields_written += 1;
     }
     assert(fields_written == data.fields.len);
-    try developer_fields_write(writer, data);
+    try developer_fields_write(writer, data, descriptions);
     try writer.writeByte('\n');
 }
 
-/// Developer fields as their stored bytes, keyed by developer data index then field number.
-/// Their base type is in a field_description message, so there is no sentinel to show as `-`
-/// and no byte order to apply.
-fn developer_fields_write(writer: *std.Io.Writer, data: *const fitz.DataMessage) !void {
+/// Developer fields keyed by developer data index then field number, not by name: a name from
+/// the file may hold spaces, which would break the line's `key=value` tokens. A described field
+/// prints like a standard one, scaled and with units; any other prints its stored bytes, since
+/// without a base type there is no sentinel to show as `-` and no byte order to apply.
+fn developer_fields_write(
+    writer: *std.Io.Writer,
+    data: *const fitz.DataMessage,
+    descriptions: *const fitz.DeveloperFieldDescriptions,
+) !void {
     var fields_written: usize = 0;
     var iterator = data.developer_fields_iterator();
     // Bounded by the definition's developer field count, at most 255.
-    while (iterator.next()) |field| {
-        assert(field.raw.len >= 1);
-        try writer.print(" dev:{d}:{d}=0x{x}", .{
-            field.developer_data_index,
-            field.field_number,
-            field.raw,
-        });
+    while (iterator.next()) |developer| {
+        assert(developer.raw.len >= 1);
+        const index = developer.developer_data_index;
+        try writer.print(" dev:{d}:{d}=", .{ index, developer.field_number });
+        if (developer_field_decode(&developer, descriptions)) |decoded| {
+            try field_value_write(writer, &decoded.field, &decoded.profile, .all);
+        } else {
+            try writer.print("0x{x}", .{developer.raw});
+        }
         fields_written += 1;
     }
     assert(fields_written == data.developer_fields.len);
@@ -528,6 +633,9 @@ fn date_time_write(writer: *std.Io.Writer, date_time: u32, zone: Zone) !void {
 
 const testing = std.testing;
 
+/// For messages without developer fields, or whose developer fields the file doesn't describe.
+const no_descriptions = fitz.DeveloperFieldDescriptions{};
+
 test "file_header_write: numbered from 1, and the longest line fits" {
     var buffer: [file_header_line_size_max]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
@@ -639,7 +747,7 @@ test "data_message_write: an unknown message prints numbers and raw values" {
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data, .all);
+    try data_message_write(&writer, &data, &no_descriptions, .all);
     try testing.expectEqualStrings(
         "DATA local=1 global_msg=325 253=1 5=[7,-,9] 7=- 200=42\n",
         writer.buffered(),
@@ -661,7 +769,7 @@ test "data_message_write: a known message prints names, scaled values and units"
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data, .all);
+    try data_message_write(&writer, &data, &no_descriptions, .all);
     try testing.expectEqualStrings(
         "DATA local=1 global_msg=record timestamp=1s distance=[0.07,-,0.09]m power=- 200=42\n",
         writer.buffered(),
@@ -708,7 +816,7 @@ test "data_message_write: a message with no fields" {
     };
     var buffer: [64]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data, .all);
+    try data_message_write(&writer, &data, &no_descriptions, .all);
     try testing.expectEqualStrings("DATA local=0 global_msg=file_id\n", writer.buffered());
 }
 
@@ -728,7 +836,7 @@ test "data_message_write: a compressed timestamp is printed before the fields" {
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data, .all);
+    try data_message_write(&writer, &data, &no_descriptions, .all);
     try testing.expectEqualStrings(
         "DATA local=1 global_msg=record timestamp=1147594040s heart_rate=146bpm\n",
         writer.buffered(),
@@ -767,7 +875,7 @@ test "data_message_write: readable detail hides empty and unknown fields and con
     };
     var buffer: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data, .readable);
+    try data_message_write(&writer, &data, &no_descriptions, .readable);
     try testing.expectEqualStrings(
         \\record
         \\  timestamp             2026-09-24T10:12:54Z
@@ -781,7 +889,7 @@ test "data_message_write: readable detail hides empty and unknown fields and con
 
     // The same message in full detail keeps every field, raw dates and positions.
     writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data, .all);
+    try data_message_write(&writer, &data, &no_descriptions, .all);
     try testing.expectEqualStrings(
         "DATA local=3 global_msg=record timestamp=1159179174s " ++
             "position_lat=537182079semicircles position_long=-9651251semicircles " ++
@@ -803,7 +911,7 @@ test "data_message_write: a readable compressed timestamp is a date" {
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data, .readable);
+    try data_message_write(&writer, &data, &no_descriptions, .readable);
     try testing.expectEqualStrings(
         \\325
         \\  timestamp             2026-09-24T10:12:54Z
@@ -886,11 +994,11 @@ test "data_message_write: a readable message with nothing to show is skipped" {
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &record, .readable);
+    try data_message_write(&writer, &record, &no_descriptions, .readable);
     try testing.expectEqualStrings("", writer.buffered());
 
     // In full detail the same message is still one line with every field.
-    try data_message_write(&writer, &record, .all);
+    try data_message_write(&writer, &record, &no_descriptions, .all);
     const line = "DATA local=0 global_msg=record power=- 200=42\n";
     try testing.expectEqualStrings(line, writer.buffered());
 }
@@ -941,7 +1049,7 @@ test "name_column_width: every profile field name fits, leaving a gap" {
     }
 }
 
-test "data_message_write: developer fields print as stored bytes, only in full detail" {
+test "data_message_write: undescribed developer fields print as bytes, only in full detail" {
     const fields = [_]fitz.FieldDefinition{
         .{ .field_definition_number = 3, .size = 1, .base_type = .uint8 },
     };
@@ -961,14 +1069,14 @@ test "data_message_write: developer fields print as stored bytes, only in full d
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data, .all);
+    try data_message_write(&writer, &data, &no_descriptions, .all);
     try testing.expectEqualStrings(
         "DATA local=3 global_msg=record heart_rate=150bpm dev:0:0=0x3412 dev:255:1=0xff\n",
         writer.buffered(),
     );
 
     writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data, .readable);
+    try data_message_write(&writer, &data, &no_descriptions, .readable);
     const block = "record\n  heart_rate            150 bpm\n\n";
     try testing.expectEqualStrings(block, writer.buffered());
 
@@ -977,9 +1085,68 @@ test "data_message_write: developer fields print as stored bytes, only in full d
     developer_only.fields = &.{};
     developer_only.raw = &.{};
     writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &developer_only, .readable);
+    try data_message_write(&writer, &developer_only, &no_descriptions, .readable);
     try testing.expectEqualStrings("", writer.buffered());
-    try data_message_write(&writer, &developer_only, .all);
+    try data_message_write(&writer, &developer_only, &no_descriptions, .all);
     const line = "DATA local=3 global_msg=record dev:0:0=0x3412 dev:255:1=0xff\n";
     try testing.expectEqualStrings(line, writer.buffered());
+}
+
+test "data_message_write: described developer fields decode like standard fields" {
+    var descriptions = fitz.DeveloperFieldDescriptions{};
+    defer descriptions.deinit(testing.allocator);
+    const described = [_]fitz.DeveloperFieldDescription{
+        .{
+            .developer_data_index = 0,
+            .field_number = 0,
+            .base_type = .uint16,
+            .name = "Power",
+            .units = "W",
+            .scale = 10,
+        },
+        // No name: decoded in full detail, hidden in readable detail.
+        .{ .developer_data_index = 1, .field_number = 2, .base_type = .uint8 },
+        // A size of 2 can't hold a uint32: bytes in full detail, hidden in readable detail.
+        .{ .developer_data_index = 2, .field_number = 3, .base_type = .uint32, .name = "Bad" },
+        // No data.
+        .{ .developer_data_index = 0, .field_number = 4, .base_type = .uint8, .name = "Empty" },
+        // Longer than the name column.
+        .{
+            .developer_data_index = 0,
+            .field_number = 5,
+            .base_type = .uint8,
+            .name = "Avg Distance per Stroke",
+        },
+    };
+    for (described) |description| try descriptions.put(testing.allocator, description);
+
+    const developer_fields = [_]fitz.DeveloperFieldDefinition{
+        .{ .field_number = 0, .size = 2, .developer_data_index = 0 },
+        .{ .field_number = 2, .size = 1, .developer_data_index = 1 },
+        .{ .field_number = 3, .size = 2, .developer_data_index = 2 },
+        .{ .field_number = 4, .size = 1, .developer_data_index = 0 },
+        .{ .field_number = 5, .size = 1, .developer_data_index = 0 },
+    };
+    const data = fitz.DataMessage{
+        .local_message_type = 3,
+        .global_message_number = 20,
+        .big_endian = false,
+        .compressed_timestamp = null,
+        .fields = &.{},
+        .raw = &.{},
+        .developer_fields = &developer_fields,
+        .developer_raw = &.{ 0x34, 0x12, 9, 0xAB, 0xCD, 0xFF, 7 },
+    };
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &data, &descriptions, .all);
+    const line = "DATA local=3 global_msg=record dev:0:0=466W dev:1:2=9 dev:2:3=0xabcd " ++
+        "dev:0:4=- dev:0:5=7\n";
+    try testing.expectEqualStrings(line, writer.buffered());
+
+    // Only developer fields, yet the block is shown, because some are named and hold data.
+    writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &data, &descriptions, .readable);
+    const block = "record\n  Power                 466 W\n  Avg Distance per Stroke 7\n\n";
+    try testing.expectEqualStrings(block, writer.buffered());
 }

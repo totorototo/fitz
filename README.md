@@ -38,9 +38,11 @@ record
 ```
 
 It shows only the fields the built-in profile knows and that hold data,
-with scale and offset applied, and skips a message with nothing to show
-(the summary still counts it). To pull out one kind of message, use awk's
-paragraph mode: `awk -v RS= '/^session\n/' dump.txt`. Dates are
+with scale and offset applied, then the developer fields the file
+describes by name (`Heart Rate  82 bpm`, the name as the file writes it),
+and skips a message with nothing to show (the summary still counts it).
+To pull out one kind of message, use awk's paragraph mode:
+`awk -v RS= '/^session\n/' dump.txt`. Dates are
 ISO 8601: UTC with a `Z`, local time (`local_timestamp`) without one, and
 a date_time below `0x10000000` (seconds since the device powered on)
 stays in seconds. Positions are in degrees.
@@ -50,10 +52,13 @@ stays in seconds. Positions are in degrees.
 It shows every field as stored, for debugging: `-` for a
 base type's invalid ("no data") sentinel, unknown messages and fields by
 number, and dates and positions in raw seconds and semicircles. Scale and
-offset still apply. Developer fields come last, as their stored bytes:
-`dev:0:3=0x5fba8940` is developer data index 0, field 3. The readable
-dump leaves them out. In both modes, arrays are in brackets, strings quoted
-and byte fields hex. A message with a compressed-timestamp header gets
+offset still apply. Developer fields come last, keyed by developer data
+index and field number rather than by name, which may hold spaces:
+`dev:0:6=82bpm` is index 0, field 6, decoded through its field_description.
+A field the file doesn't describe, or whose size doesn't fit the described
+base type, prints its stored bytes: `dev:0:3=0x5fba8940`. In both modes,
+arrays are in brackets, strings quoted and byte fields hex. A message
+with a compressed-timestamp header gets
 its rebuilt timestamp printed first, and the summary counts how many
 there were. When the buffer chains several files, each one's messages
 follow a marker: a `file 2 of 3` block, or a `FILE 2/3` line with

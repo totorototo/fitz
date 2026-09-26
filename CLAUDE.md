@@ -9,7 +9,8 @@ at a time, not all at once.
 - `src/fit.zig`: the core parser. It is pure and does no I/O: it parses an in-memory `[]const u8`.
 - `src/main.zig`: the CLI (`zig build run -- [--dump [--all]] file.fit`). All I/O lives here.
   `--dump` is for reading (a block per message, known fields with data, dates and degrees);
-  `--dump --all` is one grep-able line per message with every field as stored.
+  `--dump --all` is one grep-able line per message with every field as stored. Both decode
+  developer fields the file describes (field_description, 206).
 - `src/profile.zig`: a hand-written slice of the FIT profile (names, units, scale, offset),
   exported as `fitz.profile`. Pure lookups. Add a field only after checking it against a real
   file (e.g. totals that must agree), not from memory alone.

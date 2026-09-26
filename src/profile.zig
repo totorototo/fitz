@@ -79,6 +79,21 @@ pub const FieldProfile = struct {
     }
 };
 
+/// A developer field's profile, from its field_description: the same units, scale and offset
+/// rules as a built-in field. The name is the file's own, not necessarily snake_case, and is
+/// empty when the description has none.
+pub fn developer_field_profile(description: *const fit.DeveloperFieldDescription) FieldProfile {
+    assert(description.scale >= 1);
+    const profile = FieldProfile{
+        .name = description.name orelse "",
+        .units = description.units,
+        .scale = description.scale,
+        .offset = description.offset,
+    };
+    assert(profile.kind == .number);
+    return profile;
+}
+
 /// Returns null for a message number outside this curated subset.
 pub fn message_name(global_message_number: u16) ?[]const u8 {
     return switch (global_message_number) {
@@ -404,4 +419,31 @@ test "semicircles_degrees" {
     try testing.expectEqual(@as(f64, -180), semicircles_degrees(-(1 << 31)));
     try testing.expectApproxEqAbs(@as(f64, 45.026082), semicircles_degrees(537182079), 1e-6);
     try testing.expectApproxEqAbs(@as(f64, -0.808959), semicircles_degrees(-9651251), 1e-6);
+}
+
+test "developer_field_profile: carries the description's name, units, scale and offset" {
+    const description = fit.DeveloperFieldDescription{
+        .developer_data_index = 0,
+        .field_number = 1,
+        .base_type = .uint16,
+        .name = "Heart Rate",
+        .units = "bpm",
+        .scale = 10,
+        .offset = -5,
+    };
+    const profile = developer_field_profile(&description);
+    try std.testing.expectEqualStrings("Heart Rate", profile.name);
+    try std.testing.expectEqualStrings("bpm", profile.units);
+    try std.testing.expect(profile.is_scaled());
+    // (1234 - (-5) * 10) / 10.
+    try std.testing.expectEqual(@as(?f64, 128.4), profile.scaled(.{ .unsigned = 1234 }));
+
+    const unnamed = developer_field_profile(&.{
+        .developer_data_index = 255,
+        .field_number = 255,
+        .base_type = .uint8,
+    });
+    try std.testing.expectEqualStrings("", unnamed.name);
+    try std.testing.expectEqualStrings("", unnamed.units);
+    try std.testing.expect(!unnamed.is_scaled());
 }
