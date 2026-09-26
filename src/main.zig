@@ -70,15 +70,18 @@ pub fn main(init: std.process.Init) !void {
     defer parser.deinit();
 
     const header = parser.header;
+    // Parser.init only succeeds once both CRCs check out, so "ok" is a statement of fact here.
+    const header_crc_status: []const u8 = if (header.crc != null) "ok" else "absent";
     std.debug.print(
         "FIT file: header_size={d} protocol_version={d} profile_version={d} " ++
-            "data_size={d} has_crc={}\n\n",
+            "data_size={d} header_crc={s} file_crc=ok(0x{x:0>4})\n\n",
         .{
             header.header_size,
             header.protocol_version,
             header.profile_version,
             header.data_size,
-            header.crc != null,
+            header_crc_status,
+            parser.file_crc,
         },
     );
 

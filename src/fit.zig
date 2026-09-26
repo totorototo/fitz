@@ -6,8 +6,8 @@
 //!
 //! Scope: file header, record headers (normal + compressed timestamp, with the
 //! timestamp reconstructed), definition messages, and data messages with base-type
-//! value decoding. Names and scaling live in profile.zig. No developer fields, no
-//! CRC checks yet.
+//! value decoding. The header CRC (when present) and the file CRC are verified up
+//! front. Names and scaling live in profile.zig. No developer fields yet.
 //!
 //! Errors are for invalid external bytes; assertions are for invariants
 //! the parser itself guarantees. A failed assertion is a bug in this file.
@@ -19,6 +19,10 @@ pub const FitError = error{
     InvalidSignature,
     UnexpectedEof,
     InvalidHeaderSize,
+    /// The 14-byte header's CRC is nonzero and doesn't match header bytes 0-11.
+    HeaderCrcMismatch,
+    /// The 2-byte CRC after the data section doesn't match the header and data bytes.
+    FileCrcMismatch,
     InvalidArchitecture,
     UnknownLocalMessageType,
     InvalidBaseType,
@@ -38,6 +42,8 @@ const signature = ".FIT";
 const signature_offset = 8;
 const header_size_short = 12;
 const header_size_long = 14;
+/// Both the header CRC and the trailing file CRC are little-endian u16s.
+const crc_size = 2;
 
 /// Reserved byte, architecture byte, global message number (2), field count.
 const definition_fixed_size = 5;
@@ -92,8 +98,14 @@ fn parse_file_header(buffer: []const u8) FitError!FileHeader {
 
     var crc: ?u16 = null;
     if (header_size == header_size_long) {
-        const crc_raw = std.mem.readInt(u16, buffer[12..14], .little);
-        if (crc_raw != 0) crc = crc_raw;
+        // The header CRC covers the 12 bytes of the short header form, i.e. all but itself.
+        const crc_raw = std.mem.readInt(u16, buffer[header_size_short..][0..crc_size], .little);
+        if (crc_raw != 0) {
+            if (crc_compute(buffer[0..header_size_short]) != crc_raw) {
+                return FitError.HeaderCrcMismatch;
+            }
+            crc = crc_raw;
+        }
     }
 
     const header = FileHeader{
@@ -106,6 +118,29 @@ fn parse_file_header(buffer: []const u8) FitError!FileHeader {
     assert(header.data_start() <= buffer.len);
     assert(header.crc == null or header.header_size == header_size_long);
     return header;
+}
+
+/// FIT's CRC is CRC-16/ARC: polynomial 0x8005, reflected, initial value 0, no final XOR.
+fn crc_compute(bytes: []const u8) u16 {
+    return std.hash.crc.Crc16Arc.hash(bytes);
+}
+
+/// Checks the file CRC: the last two bytes of `file` against everything before them, header
+/// included. Returns the verified CRC.
+fn file_crc_verify(file: []const u8) FitError!u16 {
+    assert(file.len >= header_size_short + crc_size);
+    const content = file[0 .. file.len - crc_size];
+    const crc_stored = std.mem.readInt(u16, file[content.len..][0..crc_size], .little);
+
+    var crc = std.hash.crc.Crc16Arc.init();
+    crc.update(content);
+    if (crc.final() != crc_stored) return FitError.FileCrcMismatch;
+
+    // Paired check: running a reflected CRC on through its own little-endian value always
+    // leaves a zero remainder, so the stored bytes and the computed value really agree.
+    crc.update(file[content.len..]);
+    assert(crc.final() == 0);
+    return crc_stored;
 }
 
 pub const NormalRecordHeader = struct {
@@ -457,6 +492,8 @@ pub const Parser = struct {
     position: usize,
     end: usize,
     header: FileHeader,
+    /// The trailing file CRC, already verified by `init`.
+    file_crc: u16,
     definitions: [local_message_type_count]?DefinitionMessage = .{null} ** local_message_type_count,
     /// The latest full timestamp, from field 253 of a normal message or from a reconstructed
     /// compressed one. Compressed headers are resolved against it.
@@ -467,6 +504,10 @@ pub const Parser = struct {
         // Rejecting a data section that overruns the buffer up front means every later read only
         // has to be bounded by `end`, and a truncated file fails at init, not midway through.
         if (header.data_end() > buffer.len) return FitError.UnexpectedEof;
+        if (buffer.len - header.data_end() < crc_size) return FitError.UnexpectedEof;
+        // Verifying the whole file before the first record means no record is ever returned
+        // from a corrupted file. It costs one pass over bytes that are already in memory.
+        const file_crc = try file_crc_verify(buffer[0 .. header.data_end() + crc_size]);
 
         const parser = Parser{
             .allocator = allocator,
@@ -474,6 +515,7 @@ pub const Parser = struct {
             .position = header.data_start(),
             .end = header.data_end(),
             .header = header,
+            .file_crc = file_crc,
         };
         parser.assert_invariants();
         return parser;
@@ -516,6 +558,7 @@ pub const Parser = struct {
     fn assert_invariants(self: *const Parser) void {
         assert(self.end == self.header.data_end());
         assert(self.end <= self.buffer.len);
+        assert(self.buffer.len - self.end >= crc_size);
         assert(self.position >= self.header.data_start());
         assert(self.position <= self.end);
     }
@@ -608,16 +651,44 @@ pub const Parser = struct {
 
 const testing = std.testing;
 
-/// Builds a 12-byte-header FIT file around `data`. Caller owns the result.
+/// Builds a 12-byte-header FIT file around `data`, with a valid trailing file CRC. Caller owns
+/// the result.
 fn test_file_build(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    const file = try allocator.alloc(u8, header_size_short + data.len);
+    const file = try allocator.alloc(u8, header_size_short + data.len + crc_size);
     file[0] = header_size_short;
     file[1] = 0x10; // Protocol version.
     std.mem.writeInt(u16, file[2..4], 100, .little); // Profile version.
     std.mem.writeInt(u32, file[4..8], @intCast(data.len), .little);
     @memcpy(file[signature_offset..][0..signature.len], signature);
-    @memcpy(file[header_size_short..], data);
+    @memcpy(file[header_size_short..][0..data.len], data);
+    test_file_crc_write(file);
     return file;
+}
+
+/// Rewrites the trailing file CRC, e.g. after a test edits the header or data.
+fn test_file_crc_write(file: []u8) void {
+    const content_size = file.len - crc_size;
+    const crc = crc_compute(file[0..content_size]);
+    std.mem.writeInt(u16, file[content_size..][0..crc_size], crc, .little);
+}
+
+/// The FIT SDK's reference CRC: a 16-entry table applied to each byte's low then high nibble.
+/// Kept only as a test oracle for `crc_compute`.
+fn test_crc_fit_sdk(bytes: []const u8) u16 {
+    const table = [16]u16{
+        0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401,
+        0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400,
+    };
+    var crc: u16 = 0;
+    for (bytes) |byte| {
+        var temporary = table[crc & 0xF];
+        crc = (crc >> 4) & 0x0FFF;
+        crc = crc ^ temporary ^ table[byte & 0xF];
+        temporary = table[crc & 0xF];
+        crc = (crc >> 4) & 0x0FFF;
+        crc = crc ^ temporary ^ table[(byte >> 4) & 0xF];
+    }
+    return crc;
 }
 
 /// Definition: local type 0, little endian, global message 20, one 4-byte field.
@@ -638,10 +709,19 @@ test "parse_file_header: 12-byte header" {
 }
 
 test "parse_file_header: 14-byte header with and without CRC" {
-    var buffer = [_]u8{ 14, 0x10, 100, 0, 0, 0, 0, 0, '.', 'F', 'I', 'T', 0x34, 0x12 };
+    var buffer = [_]u8{ 14, 0x10, 100, 0, 0, 0, 0, 0, '.', 'F', 'I', 'T', 0, 0 };
+    const crc = crc_compute(buffer[0..12]);
+    std.mem.writeInt(u16, buffer[12..14], crc, .little);
     const with_crc = try parse_file_header(&buffer);
-    try testing.expectEqual(@as(?u16, 0x1234), with_crc.crc);
+    try testing.expectEqual(@as(?u16, crc), with_crc.crc);
     try testing.expectEqual(@as(usize, 14), with_crc.data_start());
+
+    // A nonzero CRC that doesn't match, whether the CRC or a covered byte is wrong.
+    buffer[12] ^= 0x01;
+    try testing.expectError(FitError.HeaderCrcMismatch, parse_file_header(&buffer));
+    buffer[12] ^= 0x01;
+    buffer[1] = 0x20;
+    try testing.expectError(FitError.HeaderCrcMismatch, parse_file_header(&buffer));
 
     // A zero CRC means "not calculated", not "CRC equals zero".
     buffer[12] = 0;
@@ -916,8 +996,66 @@ test "Parser: rejects a bad signature" {
 test "Parser: rejects a data size larger than the buffer" {
     const file = try test_file_build(testing.allocator, &.{ 0, 0 });
     defer testing.allocator.free(file);
+
+    // The data section overruns the buffer.
+    std.mem.writeInt(u32, file[4..8], 5, .little);
+    try testing.expectError(FitError.UnexpectedEof, Parser.init(testing.allocator, file));
+    // The data section fits, but leaves only one byte for the two-byte file CRC.
     std.mem.writeInt(u32, file[4..8], 3, .little);
     try testing.expectError(FitError.UnexpectedEof, Parser.init(testing.allocator, file));
+    // The data section fits exactly, with no room for the file CRC at all.
+    std.mem.writeInt(u32, file[4..8], 4, .little);
+    try testing.expectError(FitError.UnexpectedEof, Parser.init(testing.allocator, file));
+}
+
+test "crc_compute: matches the CRC-16/ARC check value and the FIT SDK algorithm" {
+    try testing.expectEqual(@as(u16, 0xBB3D), crc_compute("123456789"));
+    try testing.expectEqual(@as(u16, 0), crc_compute(""));
+
+    var byte: u32 = 0;
+    while (byte <= std.math.maxInt(u8)) : (byte += 1) {
+        const single = [_]u8{@intCast(byte)};
+        try testing.expectEqual(test_crc_fit_sdk(&single), crc_compute(&single));
+    }
+    const header = [_]u8{ 14, 0x20, 0x6C, 0x08, 0x10, 0x27, 0, 0, '.', 'F', 'I', 'T' };
+    try testing.expectEqual(test_crc_fit_sdk(&header), crc_compute(&header));
+    const long = [_]u8{0xA5} ** 1000;
+    try testing.expectEqual(test_crc_fit_sdk(&long), crc_compute(&long));
+}
+
+test "Parser: verifies the file CRC over the header and data" {
+    const file = try test_file_build(testing.allocator, &test_definition_local_0);
+    defer testing.allocator.free(file);
+
+    var parser = try Parser.init(testing.allocator, file);
+    try testing.expectEqual(crc_compute(file[0 .. file.len - 2]), parser.file_crc);
+    parser.deinit();
+
+    // Any flipped bit, in the header, the data or the CRC itself, is a mismatch.
+    const positions = [_]usize{ 1, header_size_short, file.len - 3, file.len - 2, file.len - 1 };
+    for (positions) |position| {
+        file[position] ^= 0x10;
+        const result = Parser.init(testing.allocator, file);
+        try testing.expectError(FitError.FileCrcMismatch, result);
+        file[position] ^= 0x10;
+    }
+}
+
+test "Parser: a 14-byte header's CRC is part of the file CRC" {
+    const data = test_definition_local_0;
+    var file = [_]u8{0} ** (header_size_long + data.len + crc_size);
+    file[0] = header_size_long;
+    std.mem.writeInt(u32, file[4..8], data.len, .little);
+    @memcpy(file[signature_offset..][0..signature.len], signature);
+    std.mem.writeInt(u16, file[12..14], crc_compute(file[0..12]), .little);
+    @memcpy(file[header_size_long..][0..data.len], &data);
+    test_file_crc_write(&file);
+
+    var parser = try Parser.init(testing.allocator, &file);
+    defer parser.deinit();
+    try testing.expect(parser.header.crc != null);
+    _ = (try parser.next()).?.definition;
+    try testing.expectEqual(@as(?Record, null), try parser.next());
 }
 
 test "Parser: rejects malformed records" {
@@ -950,12 +1088,11 @@ test "Parser: rejects malformed records" {
 }
 
 test "Parser: records never read past the data section into the file CRC" {
+    // The data message needs 4 bytes but the data section ends after 3. The file CRC follows,
+    // and it must not be read as the missing fourth byte.
     const file = try test_file_build(testing.allocator, &test_definition_local_0 ++
-        [_]u8{ 0x00, 1, 2, 3, 0xAA, 0xBB });
+        [_]u8{ 0x00, 1, 2, 3 });
     defer testing.allocator.free(file);
-    // The data section ends after byte 3; the last two bytes stand in for the trailing file CRC.
-    const data_size: u32 = @intCast(file.len - header_size_short - 2);
-    std.mem.writeInt(u32, file[4..8], data_size, .little);
 
     var parser = try Parser.init(testing.allocator, file);
     defer parser.deinit();

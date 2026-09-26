@@ -80,6 +80,11 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   whose size is a multiple of the base type size are arrays.
 - Streaming `Parser.next()` — no upfront allocation of the whole record
   list, only definition field tables are heap-allocated
+- Verifies CRC-16 (CRC-16/ARC, as in the FIT SDK) in `Parser.init`,
+  before any record is returned: the 14-byte header's CRC when it is
+  nonzero, and the required 2-byte file CRC after the data section, which
+  covers the header and data. The CLI prints `header_crc=ok|absent
+  file_crc=ok(0x…)`
 - A small built-in profile (`fitz.profile`): names for well-known global
   messages, and name, units, scale and offset for the common fields of
   file_id, file_creator, device_info, event, record, lap, session and
@@ -100,13 +105,14 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   overflow `u32` is an error, where the FIT SDK assumes a reference of 0
 - No developer field support (returns `DeveloperFieldsUnsupported` if
   encountered)
-- No CRC validation (file-level or record-level)
+- Strict on CRCs, with no opt-out: a mismatched header or file CRC, or a
+  missing file CRC, rejects the whole file, so a damaged file can't be
+  partially read
 - No support for chained/concatenated FIT files in one buffer
 
 ## Rough next steps
 
-1. CRC-16 validation (file header CRC and trailing file CRC)
-2. Developer field definitions
+1. Developer field definitions
 
 ## Layout
 

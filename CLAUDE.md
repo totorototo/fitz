@@ -12,12 +12,13 @@ at a time, not all at once.
   exported as `fitz.profile`. Pure lookups. Add a field only after checking it against a real
   file (e.g. totals that must agree), not from memory alone.
 - `src/root.zig`: the library entry point.
-- **Current scope**: file header, normal and compressed-timestamp record headers (compressed
-  timestamps are rebuilt against the latest field 253), definition messages, and data messages with base-type value decoding (`Field.element`
-  returns a typed `Value`, or null for the base type's invalid sentinel).
+- **Current scope**: file header, header and file CRC-16 verification (in `Parser.init`),
+  normal and compressed-timestamp record headers (compressed timestamps are rebuilt against
+  the latest field 253), definition messages, and data messages with base-type value decoding
+  (`Field.element` returns a typed `Value`, or null for the base type's invalid sentinel).
   Well-known messages and fields are named, scaled and given units by `profile.zig`.
 - **Not yet supported**: the full FIT profile (enum value names, date/time and semicircle
-  conversion), developer fields, CRC verification.
+  conversion), developer fields, chained FIT files in one buffer.
 - **Error policy**: `FitError` is for invalid external bytes. An `assert` is for parser invariants,
   so a failed assert means a bug in fitz, never a bad file.
 - **Targets Zig 0.16.0**: I/O needs an explicit `std.Io`, `main` takes `std.process.Init`,
