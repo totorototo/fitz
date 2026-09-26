@@ -13,7 +13,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # With no version given, setup-zig reads minimum_zig_version from build.zig.zon, so the
       # version lives in one place.
       - uses: mlugg/setup-zig@v2
@@ -31,7 +31,7 @@ jobs:
         optimize: [Debug, ReleaseSafe]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: mlugg/setup-zig@v2
       - run: zig build -Doptimize=${{ matrix.optimize }}
       - run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
