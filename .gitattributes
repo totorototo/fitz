@@ -1,0 +1,2 @@
+# Fixtures are embedded byte for byte, so a Windows checkout must not rewrite line endings.
+testdata/** -text

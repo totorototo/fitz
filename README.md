@@ -1,5 +1,7 @@
 # fitz
 
+[![CI](https://github.com/totorototo/fitz/actions/workflows/ci.yml/badge.svg)](https://github.com/totorototo/fitz/actions/workflows/ci.yml)
+
 Minimal Zig parser for the FIT (Flexible and Interoperable Data Transfer)
 binary format. FIT was authored by Garmin but is an open protocol used
 across the industry — Suunto, Coros, Wahoo and others read and write it
@@ -16,6 +18,9 @@ zig build run -- path/to/file.fit
 zig build run -- --dump path/to/file.fit > dump.txt
 zig build run -- --dump --all path/to/file.fit > dump-all.txt
 ```
+
+CI (`.github/workflows/ci.yml`) runs `zig fmt --check`, the 100-column limit, and the build
+and tests in Debug and ReleaseSafe on Linux, macOS and Windows.
 
 Without flags the CLI prints the header and a per-message-type count
 summary to stderr. `--dump` also writes each data message to stdout as a

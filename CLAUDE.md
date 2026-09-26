@@ -67,3 +67,5 @@ Assert what *must not* happen, in addition to what should:
 - Tests cover the valid space, the edge cases (0, 1, max, max+1) and the invalid space.
 - Run `zig build test --summary all` and confirm it passes before calling any work done. Plain
   `zig build test` prints nothing on success, so the summary is what shows the pass counts.
+- CI (`.github/workflows/ci.yml`) also checks `zig fmt`, the 100-column limit and ReleaseSafe,
+  so run those locally too before pushing.
