@@ -9,9 +9,11 @@ at a time, not all at once.
 - `src/fit.zig`: the core parser. It is pure and does no I/O: it parses an in-memory `[]const u8`.
 - `src/main.zig`: the CLI (`zig build run -- file.fit`). All I/O lives here.
 - `src/root.zig`: the library entry point.
-- **Current scope (v0.1)**: file header, normal and compressed-timestamp record headers,
-  definition messages, and data messages as raw bytes.
-- **Not yet supported**: semantic field decoding, developer fields, CRC verification.
+- **Current scope**: file header, normal and compressed-timestamp record headers,
+  definition messages, and data messages with base-type value decoding (`Field.element`
+  returns a typed `Value`, or null for the base type's invalid sentinel).
+- **Not yet supported**: the FIT profile (message/field names, scales, units),
+  developer fields, CRC verification.
 - **Error policy**: `FitError` is for invalid external bytes. An `assert` is for parser invariants,
   so a failed assert means a bug in fitz, never a bad file.
 - **Targets Zig 0.16.0**: I/O needs an explicit `std.Io`, `main` takes `std.process.Init`,
