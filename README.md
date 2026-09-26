@@ -6,9 +6,6 @@ across the industry — Suunto, Coros, Wahoo and others read and write it
 too, so this isn't Garmin-specific. Library + CLI, built to grow feature
 by feature rather than all at once.
 
-Not compile-tested against a live Zig toolchain (sandbox has no network
-access to ziglang.org) — build it locally and report back any errors.
-
 ## Build
 
 ```sh
@@ -17,24 +14,9 @@ zig build test       # runs unit tests
 zig build run -- path/to/file.fit
 ```
 
-Written and adjusted for Zig 0.16.0. That release shipped a large
-breaking change: **all I/O now requires an explicit `Io` instance**
-(`std.fs` moved to `std.Io`), `main` can take a `std.process.Init`
-parameter ("Juicy Main") for the allocator/Io/args instead of reaching
-for globals, and containers like `ArrayList` dropped their managed
-(allocator-as-field) form in favor of `.empty` + passing the allocator
-to each call.
-
-This only actually touches `main.zig` and the build script — `fit.zig`
-does no I/O of its own (it parses an in-memory `[]const u8`), so the
-core parser is unaffected by any of this churn. If `zig build` still
-complains, the likely spots are:
-
-- `build.zig.zon` may need a `.fingerprint` field the compiler will
-  suggest a value for on first build — paste it in if asked.
-- `std.AutoHashMap(u16, u32).getOrPutValue(...)` in `main.zig`: if this
-  container also lost its managed form, it'll want `gpa` passed as the
-  first argument.
+Targets Zig 0.16.0 (explicit `std.Io`, `std.process.Init` main,
+unmanaged containers). Only `main.zig` does I/O; `fit.zig` parses an
+in-memory `[]const u8`, so the core parser is independent of I/O APIs.
 
 ## Design note: negative space
 
@@ -55,7 +37,8 @@ Error returns (`FitError.*`) are reserved for things that legitimately
 vary in untrusted external bytes — a truncated file, an unknown local
 message type, an unsupported record shape. Anything the parser itself
 guarantees internally (e.g. a local message type always fits the 16-slot
-definitions table because its type is `u4`) isn't re-checked at runtime.
+definitions table because its type is `u4`) is enforced by the types or
+by an `assert`. A failed assert means a bug in fitz, never a bad file.
 
 ## What v0.1 does
 
