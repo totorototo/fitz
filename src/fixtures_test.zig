@@ -13,8 +13,6 @@ const fitz = @import("fitz");
 
 const record_message = 20;
 const field_description_message = 206;
-/// The two bytes after the data section.
-const file_crc_size = 2;
 
 const Counts = struct {
     definition: u32 = 0,
@@ -23,7 +21,7 @@ const Counts = struct {
     developer_fields: u32 = 0,
 };
 
-/// Counts the records of the first FIT file in `buffer`. Chained files after it are left out.
+/// Counts the records of every chained FIT file in `buffer`.
 fn counts_read(buffer: []const u8) !Counts {
     var parser = try fitz.Parser.init(testing.allocator, buffer);
     defer parser.deinit();
@@ -42,15 +40,6 @@ fn counts_read(buffer: []const u8) !Counts {
     }
     assert(counts.data + counts.definition <= buffer.len);
     return counts;
-}
-
-/// The size of the first FIT file in `buffer`: header, data section and file CRC.
-fn file_size(buffer: []const u8) !usize {
-    var parser = try fitz.Parser.init(testing.allocator, buffer);
-    defer parser.deinit();
-    const size = parser.header.data_end() + file_crc_size;
-    assert(size <= buffer.len);
-    return size;
 }
 
 /// The base type a field_description message (206) gives one developer field. It is found the
@@ -240,47 +229,46 @@ test "coros-pace-2-cycling-misaligned-fields.fit: the strict base-type policy re
     try testing.expect(records > 0);
 }
 
-/// Parses each chained FIT file in `buffer` in turn, as fitz can't yet do on its own. Returns
-/// the data message count per file, or the error of the first file that fails.
-fn chained_data_counts(buffer: []const u8, counts: []u32) !usize {
-    var offset: usize = 0;
-    var files: usize = 0;
-    // Bounded by the size of `counts`.
-    while (offset < buffer.len) : (files += 1) {
-        assert(files < counts.len);
-        const rest = buffer[offset..];
-        counts[files] = (try counts_read(rest)).data;
-        offset += try file_size(rest);
+const file_count_max = 8;
+
+/// The data message count of each chained file in `buffer`, told apart by `file_index`.
+fn file_data_counts(buffer: []const u8, counts: *[file_count_max]u32) !u32 {
+    var parser = try fitz.Parser.init(testing.allocator, buffer);
+    defer parser.deinit();
+    assert(parser.file_count <= file_count_max);
+    @memset(counts, 0);
+    while (try parser.next()) |record| {
+        if (record == .data) counts[parser.file_index] += 1;
     }
-    assert(offset == buffer.len);
-    return files;
+    // Every file was reached, the last one included.
+    assert(parser.file_index + 1 == parser.file_count);
+    return parser.file_count;
 }
 
-test "chained files: fitz reads only the first one, the rest is still valid FIT" {
-    var counts: [8]u32 = undefined;
+test "chained files: every file is read, each with its own definitions" {
+    var counts: [file_count_max]u32 = undefined;
 
     const settings = @embedFile("activity-settings.fit");
-    try testing.expectEqual(@as(usize, 771), try file_size(settings));
-    try testing.expectEqual(@as(usize, 2), try chained_data_counts(settings, &counts));
-    try testing.expectEqual(@as(u32, 22), counts[0]);
+    try testing.expectEqual(@as(u32, 2), try file_data_counts(settings, &counts));
+    try testing.expectEqualSlices(u32, &.{ 22, 3 }, counts[0..2]);
 
     // python-fitparse counts 3023 messages over all the chained files.
     const multiple = @embedFile("sample_mulitple_header.fit");
-    try testing.expectEqual(@as(u32, 1862), (try counts_read(multiple)).data);
-    const files = try chained_data_counts(multiple, &counts);
+    const files = try file_data_counts(multiple, &counts);
+    try testing.expect(files > 1);
     var total: u32 = 0;
-    for (counts[0..files]) |count| total += count;
+    for (counts[0..files]) |count| {
+        try testing.expect(count > 0);
+        total += count;
+    }
     try testing.expectEqual(@as(u32, 3023), total);
+    try testing.expectEqual(@as(u32, 3023), (try counts_read(multiple)).data);
 }
 
-test "activity-settings-corruptheader.fit: the second file's header is corrupt" {
-    // fitz reads the first file and doesn't look past it, so today this parses. fitparse
-    // rejects the whole buffer; chained-file support should too.
+test "activity-settings-corruptheader.fit: a corrupt second header rejects the whole buffer" {
+    // The second file's signature reads ".GIT". fitparse rejects the whole buffer too, and
+    // Parser.init fails before the first file's records are returned.
     const buffer = @embedFile("activity-settings-corruptheader.fit");
-    try testing.expectEqual(@as(u32, 22), (try counts_read(buffer)).data);
-    const size = try file_size(buffer);
-    try testing.expect(size < buffer.len);
-    // Its signature reads ".GIT".
-    const second = fitz.Parser.init(testing.allocator, buffer[size..]);
-    try testing.expectError(fitz.FitError.InvalidSignature, second);
+    const result = fitz.Parser.init(testing.allocator, buffer);
+    try testing.expectError(fitz.FitError.InvalidSignature, result);
 }

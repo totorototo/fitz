@@ -18,9 +18,9 @@ All files come from the test suite of python-fitparse
 | `activity-filecrc.fit` | Rejected: file CRC mismatch |
 | `activity-unexpected-eof.fit` | Rejected: truncated |
 | `coros-pace-2-cycling-misaligned-fields.fit` | Rejected by the strict base-type policy: an event field declared uint32 with size 1. The SDK and fitparse read it as bytes |
-| `activity-settings.fit` | Two chained files; fitz reads the first |
+| `activity-settings.fit` | Two chained files: 22 and 3 data messages |
 | `sample_mulitple_header.fit` | Chained files, 3023 data messages in all (fitparse's count) |
-| `activity-settings-corruptheader.fit` | Chained files where the second header's signature is `.GIT` |
+| `activity-settings-corruptheader.fit` | Rejected: chained files where the second header's signature is `.GIT` |
 
 Don't add FIT files you recorded yourself: they hold GPS tracks and health data. `.gitignore`
 ignores `*.fit` everywhere except here.

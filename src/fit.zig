@@ -6,10 +6,10 @@
 //!
 //! Scope: file header, record headers (normal + compressed timestamp, with the
 //! timestamp reconstructed), definition messages, and data messages with base-type
-//! value decoding. The header CRC (when present) and the file CRC are verified up
-//! front. Developer fields are split out of each data message as raw bytes; their base types
-//! live in field_description messages, which this file doesn't interpret. Names and scaling
-//! live in profile.zig.
+//! value decoding. Chained FIT files in one buffer are read in turn. Every file's header
+//! CRC (when present) and file CRC are verified up front. Developer fields are split out of
+//! each data message as raw bytes; their base types live in field_description messages, which
+//! this file doesn't interpret. Names and scaling live in profile.zig.
 //!
 //! Errors are for invalid external bytes; assertions are for invariants
 //! the parser itself guarantees. A failed assertion is a bug in this file.
@@ -120,6 +120,43 @@ fn parse_file_header(buffer: []const u8) FitError!FileHeader {
     assert(header.data_start() <= buffer.len);
     assert(header.crc == null or header.header_size == header_size_long);
     return header;
+}
+
+/// The smallest possible file: a 12-byte header, no data and the file CRC.
+const file_size_min = header_size_short + crc_size;
+
+/// Checks the one file that starts `bytes`: its header, that its data section and file CRC fit,
+/// and the file CRC. Returns the file's size. Bytes after it are the caller's.
+fn file_verify(bytes: []const u8) FitError!usize {
+    const header = try parse_file_header(bytes);
+    // Rejecting a data section that overruns the buffer up front means every later read only
+    // has to be bounded by the data section's end, and a truncated file fails at init.
+    if (header.data_end() > bytes.len) return FitError.UnexpectedEof;
+    if (bytes.len - header.data_end() < crc_size) return FitError.UnexpectedEof;
+    const size = header.data_end() + crc_size;
+    _ = try file_crc_verify(bytes[0..size]);
+    assert(size >= file_size_min);
+    assert(size <= bytes.len);
+    return size;
+}
+
+/// Checks every chained file in `buffer`, in order. Every byte must belong to a file, so bytes
+/// after the last one that don't form a whole valid file are an error, not ignored. Returns the
+/// number of files.
+fn files_verify(buffer: []const u8) FitError!u32 {
+    const file_count_max = buffer.len / file_size_min;
+    var offset: usize = 0;
+    var file_count: u32 = 0;
+    // Bounded: every file consumes at least file_size_min bytes.
+    while (true) {
+        assert(file_count <= file_count_max);
+        offset += try file_verify(buffer[offset..]);
+        file_count += 1;
+        if (offset == buffer.len) break;
+    }
+    assert(offset == buffer.len);
+    assert(file_count >= 1 and file_count <= file_count_max);
+    return file_count;
 }
 
 /// FIT's CRC is CRC-16/ARC: polynomial 0x8005, reflected, initial value 0, no final XOR.
@@ -594,6 +631,12 @@ pub const Record = union(enum) {
     data: DataMessage,
 };
 
+/// Reads every FIT file chained in the buffer, in order. `header`, `file_crc` and `file_index`
+/// describe the file the latest record came from. Each file starts with no definitions and no
+/// timestamp reference, as a separate file would.
+///
+/// A record's `fields` and `developer_fields` point into its definition, which a redefinition
+/// or the next file frees, so read them before the next call to `next`.
 /// After `next` returns an error the parser's position is unspecified;
 /// stop iterating and call `deinit`.
 pub const Parser = struct {
@@ -601,8 +644,13 @@ pub const Parser = struct {
     buffer: []const u8,
     position: usize,
     end: usize,
+    /// Where the current file's header starts in `buffer`.
+    file_start: usize,
+    /// 0 for the first file, up to `file_count - 1`.
+    file_index: u32,
+    file_count: u32,
     header: FileHeader,
-    /// The trailing file CRC, already verified by `init`.
+    /// The current file's trailing CRC, already verified by `init`.
     file_crc: u16,
     definitions: [local_message_type_count]?DefinitionMessage = .{null} ** local_message_type_count,
     /// The latest full timestamp, from field 253 of a normal message or from a reconstructed
@@ -610,32 +658,61 @@ pub const Parser = struct {
     timestamp_reference: ?u32 = null,
 
     pub fn init(allocator: std.mem.Allocator, buffer: []const u8) FitError!Parser {
-        const header = try parse_file_header(buffer);
-        // Rejecting a data section that overruns the buffer up front means every later read only
-        // has to be bounded by `end`, and a truncated file fails at init, not midway through.
-        if (header.data_end() > buffer.len) return FitError.UnexpectedEof;
-        if (buffer.len - header.data_end() < crc_size) return FitError.UnexpectedEof;
-        // Verifying the whole file before the first record means no record is ever returned
-        // from a corrupted file. It costs one pass over bytes that are already in memory.
-        const file_crc = try file_crc_verify(buffer[0 .. header.data_end() + crc_size]);
-
-        const parser = Parser{
+        // Verifying every file before the first record means no record is ever returned from a
+        // buffer with a corrupted or truncated file anywhere in it, even a later chained one.
+        // It costs one pass over bytes that are already in memory.
+        const file_count = try files_verify(buffer);
+        var parser = Parser{
             .allocator = allocator,
             .buffer = buffer,
-            .position = header.data_start(),
-            .end = header.data_end(),
-            .header = header,
-            .file_crc = file_crc,
+            .position = undefined,
+            .end = undefined,
+            .file_start = 0,
+            .file_index = 0,
+            .file_count = file_count,
+            .header = undefined,
+            .file_crc = undefined,
         };
+        parser.file_load(0);
+        assert(parser.file_count >= 1);
         parser.assert_invariants();
         return parser;
     }
 
     pub fn deinit(self: *Parser) void {
+        self.definitions_free();
+    }
+
+    fn definitions_free(self: *Parser) void {
         for (&self.definitions) |*definition_slot| {
             if (definition_slot.*) |definition| self.definition_free(&definition);
             definition_slot.* = null;
         }
+    }
+
+    /// Points the parser at the file whose header starts at `file_start`. `init` has verified
+    /// it, so its header can't fail to parse here.
+    fn file_load(self: *Parser, file_start: usize) void {
+        assert(file_start < self.buffer.len);
+        const file = self.buffer[file_start..];
+        const header = parse_file_header(file) catch unreachable;
+        self.file_start = file_start;
+        self.header = header;
+        self.position = file_start + header.data_start();
+        self.end = file_start + header.data_end();
+        self.file_crc = std.mem.readInt(u16, self.buffer[self.end..][0..crc_size], .little);
+        assert(self.end + crc_size <= self.buffer.len);
+    }
+
+    /// Moves to the next chained file. Its local message types and timestamps are its own.
+    fn file_next(self: *Parser) void {
+        assert(self.position == self.end);
+        assert(self.file_index + 1 < self.file_count);
+        self.definitions_free();
+        self.timestamp_reference = null;
+        self.file_index += 1;
+        self.file_load(self.end + crc_size);
+        self.assert_invariants();
     }
 
     fn definition_free(self: *Parser, definition: *const DefinitionMessage) void {
@@ -643,11 +720,14 @@ pub const Parser = struct {
         self.allocator.free(definition.developer_fields);
     }
 
-    /// Returns the next record, or null once the data section (as sized
-    /// by the file header) is exhausted.
+    /// Returns the next record, or null once the data section of the last file is exhausted.
     pub fn next(self: *Parser) FitError!?Record {
         self.assert_invariants();
-        if (self.position == self.end) return null;
+        // A loop, because a chained file may have an empty data section. Bounded by file_count.
+        while (self.position == self.end) {
+            if (self.file_index + 1 == self.file_count) return null;
+            self.file_next();
+        }
 
         const position_before = self.position;
         const header_byte = self.buffer[self.position];
@@ -671,11 +751,15 @@ pub const Parser = struct {
     }
 
     fn assert_invariants(self: *const Parser) void {
-        assert(self.end == self.header.data_end());
+        assert(self.file_index < self.file_count);
+        assert(self.end == self.file_start + self.header.data_end());
         assert(self.end <= self.buffer.len);
         assert(self.buffer.len - self.end >= crc_size);
-        assert(self.position >= self.header.data_start());
+        assert(self.position >= self.file_start + self.header.data_start());
         assert(self.position <= self.end);
+        // Negative space: the last file ends the buffer, and no other file does.
+        const last = self.file_index + 1 == self.file_count;
+        assert(last == (self.end + crc_size == self.buffer.len));
     }
 
     /// Bytes left in the data section. Comparing against this, rather than `position + n > end`,
@@ -1273,6 +1357,110 @@ test "Parser: records never read past the data section into the file CRC" {
     defer parser.deinit();
     _ = (try parser.next()).?.definition;
     try testing.expectError(FitError.UnexpectedEof, parser.next());
+}
+
+/// Chains the files built around each of `data_sections` into one buffer. Caller owns it.
+fn test_files_chain(allocator: std.mem.Allocator, data_sections: []const []const u8) ![]u8 {
+    assert(data_sections.len >= 1);
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+    for (data_sections) |data| {
+        const file = try test_file_build(allocator, data);
+        defer allocator.free(file);
+        try buffer.appendSlice(allocator, file);
+    }
+    return buffer.toOwnedSlice(allocator);
+}
+
+const test_data_local_0 = [_]u8{ 0x00, 0xE8, 0x03, 0x00, 0x00 }; // Timestamp 1000.
+
+test "Parser: reads chained files in order, an empty one included" {
+    const second = [_]u8{ 0x00, 0xE9, 0x03, 0x00, 0x00 }; // Timestamp 1001.
+    const buffer = try test_files_chain(testing.allocator, &.{
+        &test_definition_local_0 ++ test_data_local_0,
+        &.{},
+        &test_definition_local_0 ++ second,
+    });
+    defer testing.allocator.free(buffer);
+
+    var parser = try Parser.init(testing.allocator, buffer);
+    defer parser.deinit();
+    try testing.expectEqual(@as(u32, 3), parser.file_count);
+    try testing.expectEqual(@as(u32, 0), parser.file_index);
+    const first_crc = parser.file_crc;
+
+    _ = (try parser.next()).?.definition;
+    const data_first = (try parser.next()).?.data;
+    try testing.expectEqualSlices(u8, test_data_local_0[1..], data_first.raw);
+    try testing.expectEqual(@as(u32, 0), parser.file_index);
+
+    // The empty second file is passed over: the next record is the third file's definition.
+    _ = (try parser.next()).?.definition;
+    try testing.expectEqual(@as(u32, 2), parser.file_index);
+    try testing.expect(parser.file_crc != first_crc);
+    const data_third = (try parser.next()).?.data;
+    try testing.expectEqualSlices(u8, second[1..], data_third.raw);
+    try testing.expectEqual(@as(?Record, null), try parser.next());
+    try testing.expectEqual(@as(?Record, null), try parser.next());
+    try testing.expectEqual(@as(u32, 2), parser.file_index);
+}
+
+test "Parser: a chained file doesn't inherit definitions or the timestamp reference" {
+    const cases = [_]struct { second: []const u8, expected: FitError }{
+        // Local type 0 was defined only in the first file.
+        .{ .second = &test_data_local_0, .expected = FitError.UnknownLocalMessageType },
+        // The first file's timestamp 1000 can't anchor a compressed header in the second.
+        .{
+            .second = &test_definition_local_1_compressed ++ [_]u8{ 0b1_01_00101, 60 },
+            .expected = FitError.CompressedTimestampWithoutReference,
+        },
+    };
+    for (cases) |case| {
+        const buffer = try test_files_chain(testing.allocator, &.{
+            &test_definition_local_0 ++ test_data_local_0,
+            case.second,
+        });
+        defer testing.allocator.free(buffer);
+
+        var parser = try Parser.init(testing.allocator, buffer);
+        defer parser.deinit();
+        _ = (try parser.next()).?.definition;
+        _ = (try parser.next()).?.data;
+        if (case.expected == FitError.CompressedTimestampWithoutReference) {
+            _ = (try parser.next()).?.definition;
+        }
+        try testing.expectError(case.expected, parser.next());
+        try testing.expectEqual(@as(u32, 1), parser.file_index);
+    }
+}
+
+test "Parser.init: any bad chained file rejects the whole buffer" {
+    const valid = try test_files_chain(testing.allocator, &.{ &test_definition_local_0, &.{} });
+    defer testing.allocator.free(valid);
+    // The second file is exactly file_size_min bytes, the smallest valid file.
+    try testing.expectEqual(file_size_min, valid.len - header_size_short -
+        test_definition_local_0.len - crc_size);
+    var parser = try Parser.init(testing.allocator, valid);
+    try testing.expectEqual(@as(u32, 2), parser.file_count);
+    parser.deinit();
+
+    // Truncated anywhere in the second file: its header, or its CRC.
+    const first_size = valid.len - file_size_min;
+    for ([_]usize{ 1, header_size_short - 1, header_size_short, file_size_min - 1 }) |size| {
+        const truncated = Parser.init(testing.allocator, valid[0 .. first_size + size]);
+        try testing.expectError(FitError.UnexpectedEof, truncated);
+    }
+
+    const buffer = try testing.allocator.dupe(u8, valid);
+    defer testing.allocator.free(buffer);
+    buffer[buffer.len - 1] ^= 0x10;
+    try testing.expectError(FitError.FileCrcMismatch, Parser.init(testing.allocator, buffer));
+    buffer[buffer.len - 1] ^= 0x10;
+    buffer[first_size + signature_offset] = 'G';
+    try testing.expectError(FitError.InvalidSignature, Parser.init(testing.allocator, buffer));
+    buffer[first_size + signature_offset] = '.';
+    buffer[first_size] = 0;
+    try testing.expectError(FitError.InvalidHeaderSize, Parser.init(testing.allocator, buffer));
 }
 
 test "BaseType.from_byte: accepts exactly the 17 canonical bytes" {

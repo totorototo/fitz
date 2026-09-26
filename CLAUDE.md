@@ -18,15 +18,16 @@ at a time, not all at once.
   name (list them in `build.zig` `fixtures`). Expected values must come from outside fitz
   (fitparse's tests/CSV, or cross-checks within the file), not from fitz's own output. Never
   commit personal recordings (GPS and health data).
-- **Current scope**: file header, header and file CRC-16 verification (in `Parser.init`),
-  normal and compressed-timestamp record headers (compressed timestamps are rebuilt against
+- **Current scope**: file header, chained files in one buffer (all verified in `Parser.init`,
+  each with its own definitions; `file_index`/`file_count`), header and file CRC-16
+  verification, normal and compressed-timestamp record headers (compressed timestamps are rebuilt against
   the latest field 253), definition messages, and data messages with base-type value decoding
   (`Field.element` returns a typed `Value`, or null for the base type's invalid sentinel).
   Well-known messages and fields are named, scaled and given units by `profile.zig`.
   Developer field definitions are parsed and each data message's developer fields are split out
   as raw bytes (`DeveloperField.field(base_type)` decodes one once the caller knows its type).
 - **Not yet supported**: the full FIT profile (enum value names), decoding developer fields
-  through field_description (206) messages, chained FIT files in one buffer.
+  through field_description (206) messages.
 - **Error policy**: `FitError` is for invalid external bytes. An `assert` is for parser invariants,
   so a failed assert means a bug in fitz, never a bad file.
 - **Targets Zig 0.16.0**: I/O needs an explicit `std.Io`, `main` takes `std.process.Init`,

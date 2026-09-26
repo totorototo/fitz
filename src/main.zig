@@ -88,13 +88,16 @@ pub fn main(init: std.process.Init) !void {
     var parser = try fitz.Parser.init(allocator, buffer);
     defer parser.deinit();
 
+    // Before the first `next` this is the first file's header; the counts cover every file.
     const header = parser.header;
-    // Parser.init only succeeds once both CRCs check out, so "ok" is a statement of fact here.
+    assert(parser.file_index == 0);
+    // Parser.init only succeeds once every CRC checks out, so "ok" is a statement of fact here.
     const header_crc_status: []const u8 = if (header.crc != null) "ok" else "absent";
     std.debug.print(
-        "FIT file: header_size={d} protocol_version={d} profile_version={d} " ++
+        "FIT file: files={d} header_size={d} protocol_version={d} profile_version={d} " ++
             "data_size={d} header_crc={s} file_crc=ok(0x{x:0>4})\n\n",
         .{
+            parser.file_count,
             header.header_size,
             header.protocol_version,
             header.profile_version,

@@ -113,11 +113,18 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   whose size is a multiple of the base type size are arrays.
 - Streaming `Parser.next()` — no upfront allocation of the whole record
   list, only definition field tables are heap-allocated
-- Verifies CRC-16 (CRC-16/ARC, as in the FIT SDK) in `Parser.init`,
-  before any record is returned: the 14-byte header's CRC when it is
-  nonzero, and the required 2-byte file CRC after the data section, which
-  covers the header and data. The CLI prints `header_crc=ok|absent
-  file_crc=ok(0x…)`
+- Reads chained FIT files (several files back to back in one buffer, e.g.
+  an activity followed by settings) in turn. `Parser.init` checks every
+  file first, so a bad later file rejects the whole buffer before any
+  record. Each file starts with no definitions and no timestamp reference;
+  `parser.file_index` / `file_count` tell the files apart. Every byte must
+  belong to a file: trailing bytes that aren't a whole valid file are an
+  error, not ignored
+- Verifies CRC-16 (CRC-16/ARC, as in the FIT SDK) in `Parser.init`, for
+  every chained file, before any record is returned: the 14-byte
+  header's CRC when it is nonzero, and the required 2-byte file CRC
+  after the data section, which covers the header and data. The CLI prints `files=N` and the first
+  file's `header_crc=ok|absent file_crc=ok(0x…)`
 - A small built-in profile (`fitz.profile`): names for well-known global
   messages, and name, units, scale and offset for the common fields of
   file_id, file_creator, device_info, event, record, lap, session and
@@ -144,18 +151,12 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 - Strict on CRCs, with no opt-out: a mismatched header or file CRC, or a
   missing file CRC, rejects the whole file, so a damaged file can't be
   partially read
-- No support for chained/concatenated FIT files in one buffer: only the
-  first file is read, and the bytes after its CRC are ignored, even when
-  they aren't valid FIT (`testdata/activity-settings-corruptheader.fit`)
 
 ## Rough next steps
 
-1. Chained FIT files: read every file in the buffer, and reject one with
-   a bad header or CRC. The fixture tests already expect fitparse's 3023
-   messages for `sample_mulitple_header.fit`
-2. Decide whether to relax the base-type policy to the SDK's byte
+1. Decide whether to relax the base-type policy to the SDK's byte
    fallback for mis-sized fields (the Coros file above)
-3. Decode developer fields through their field_description messages
+2. Decode developer fields through their field_description messages
    (name, base type, units, scale, offset)
 
 ## Layout
