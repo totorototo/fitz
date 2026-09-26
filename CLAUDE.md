@@ -14,6 +14,10 @@ at a time, not all at once.
   exported as `fitz.profile`. Pure lookups. Add a field only after checking it against a real
   file (e.g. totals that must agree), not from memory alone.
 - `src/root.zig`: the library entry point.
+- `src/fixtures_test.zig` + `testdata/`: tests against real third-party FIT files, embedded by
+  name (list them in `build.zig` `fixtures`). Expected values must come from outside fitz
+  (fitparse's tests/CSV, or cross-checks within the file), not from fitz's own output. Never
+  commit personal recordings (GPS and health data).
 - **Current scope**: file header, header and file CRC-16 verification (in `Parser.init`),
   normal and compressed-timestamp record headers (compressed timestamps are rebuilt against
   the latest field 253), definition messages, and data messages with base-type value decoding

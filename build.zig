@@ -50,4 +50,38 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
+    // Tests against real files get their own module, so the fixtures are embedded only there
+    // and never in the library module that other packages import. @embedFile can't reach
+    // outside src/, so each file is named here and embedded by that name.
+    const fixtures_module = b.createModule(.{
+        .root_source_file = b.path("src/fixtures_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "fitz", .module = fitz_mod },
+        },
+    });
+    for (fixtures) |fixture| {
+        fixtures_module.addAnonymousImport(fixture, .{
+            .root_source_file = b.path(b.fmt("testdata/{s}", .{fixture})),
+        });
+    }
+    const fixtures_tests = b.addTest(.{ .root_module = fixtures_module });
+    test_step.dependOn(&b.addRunArtifact(fixtures_tests).step);
 }
+
+/// Files in testdata/ that src/fixtures_test.zig embeds. See testdata/README.md.
+const fixtures = [_][]const u8{
+    "20170518-191602-1740899583.fit",
+    "Activity.fit",
+    "DeveloperData.fit",
+    "activity-filecrc.fit",
+    "activity-settings-corruptheader.fit",
+    "activity-settings.fit",
+    "activity-unexpected-eof.fit",
+    "compressed-speed-distance-records.csv",
+    "compressed-speed-distance.fit",
+    "coros-pace-2-cycling-misaligned-fields.fit",
+    "sample_mulitple_header.fit",
+};

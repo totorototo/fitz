@@ -10,7 +10,7 @@ by feature rather than all at once.
 
 ```sh
 zig build            # builds lib + cli into zig-out/
-zig build test       # runs unit tests
+zig build test       # runs unit tests and the tests against testdata/
 zig build run -- path/to/file.fit
 zig build run -- --dump path/to/file.fit > dump.txt
 zig build run -- --dump --all path/to/file.fit > dump-all.txt
@@ -136,7 +136,9 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 - Strict on CRCs, with no opt-out: a mismatched header or file CRC, or a
   missing file CRC, rejects the whole file, so a damaged file can't be
   partially read
-- No support for chained/concatenated FIT files in one buffer
+- No support for chained/concatenated FIT files in one buffer: only the
+  first file is read, and the bytes after its CRC are ignored, even when
+  they aren't valid FIT (`testdata/activity-settings-corruptheader.fit`)
 
 ## Rough next steps
 
@@ -154,4 +156,6 @@ src/
   profile.zig  curated FIT profile slice: message/field names, units, scale, offset
   root.zig   library re-exports (`@import("fitz")`)
   main.zig   CLI: header info, per-message-type counts, `--dump` of decoded fields
+  fixtures_test.zig  tests against the real files in testdata/
+testdata/    third-party FIT fixtures (python-fitparse, MIT); see testdata/README.md
 ```
