@@ -88,25 +88,6 @@ pub fn main(init: std.process.Init) !void {
     var parser = try fitz.Parser.init(allocator, buffer);
     defer parser.deinit();
 
-    // Before the first `next` this is the first file's header; the counts cover every file.
-    const header = parser.header;
-    assert(parser.file_index == 0);
-    // Parser.init only succeeds once every CRC checks out, so "ok" is a statement of fact here.
-    const header_crc_status: []const u8 = if (header.crc != null) "ok" else "absent";
-    std.debug.print(
-        "FIT file: files={d} header_size={d} protocol_version={d} profile_version={d} " ++
-            "data_size={d} header_crc={s} file_crc=ok(0x{x:0>4})\n\n",
-        .{
-            parser.file_count,
-            header.header_size,
-            header.protocol_version,
-            header.profile_version,
-            header.data_size,
-            header_crc_status,
-            parser.file_crc,
-        },
-    );
-
     // The dump goes to stdout so it can be piped or redirected on its own; the header and
     // summary stay on stderr.
     var stdout_buffer: [4096]u8 = undefined;
@@ -118,10 +99,77 @@ pub fn main(init: std.process.Init) !void {
 
     var data_counts = std.AutoHashMap(u16, u32).init(allocator);
     defer data_counts.deinit();
+    assert(parser.file_index == 0);
+    try file_started(&parser, dump);
     const record_counts = try records_process(&parser, dump, &data_counts);
     if (dump) |active| try active.writer.flush();
 
     counts_print(&record_counts, &data_counts, buffer.len);
+}
+
+/// Announces the file the parser is in: its header line on stderr and, when the buffer chains
+/// several files, a marker in the dump. Called for the first file before any record, then when
+/// a record comes from a new file. An empty chained file has no records, so it isn't announced;
+/// the numbering shows the gap.
+fn file_started(parser: *const fitz.Parser, dump: ?Dump) !void {
+    assert(parser.file_index < parser.file_count);
+    var line_buffer: [file_header_line_size_max]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&line_buffer);
+    // A test checks that the longest possible line fits.
+    const header = &parser.header;
+    file_header_write(&line, header, parser.file_crc, parser.file_index, parser.file_count) catch
+        unreachable;
+    std.debug.print("{s}", .{line.buffered()});
+
+    const active = dump orelse return;
+    if (parser.file_count > 1) {
+        try file_marker_write(active.writer, parser.file_index, parser.file_count, active.detail);
+    }
+}
+
+const file_header_line_size_max = 160;
+
+/// `FIT file N/M: header_size=… file_crc=ok(0x…)`, then a blank line. N counts from 1.
+fn file_header_write(
+    writer: *std.Io.Writer,
+    header: *const fitz.FileHeader,
+    file_crc: u16,
+    file_index: u32,
+    file_count: u32,
+) std.Io.Writer.Error!void {
+    assert(file_index < file_count);
+    // Parser.init only succeeds once every CRC checks out, so "ok" is a statement of fact here.
+    const header_crc_status: []const u8 = if (header.crc != null) "ok" else "absent";
+    try writer.print(
+        "FIT file {d}/{d}: header_size={d} protocol_version={d} profile_version={d} " ++
+            "data_size={d} header_crc={s} file_crc=ok(0x{x:0>4})\n\n",
+        .{
+            file_index + 1,
+            file_count,
+            header.header_size,
+            header.protocol_version,
+            header.profile_version,
+            header.data_size,
+            header_crc_status,
+            file_crc,
+        },
+    );
+}
+
+/// Readable detail: a `file N of M` block, which awk's paragraph mode sees as its own record.
+/// Full detail: a `FILE N/M` line. N counts from 1.
+fn file_marker_write(
+    writer: *std.Io.Writer,
+    file_index: u32,
+    file_count: u32,
+    detail: DumpDetail,
+) std.Io.Writer.Error!void {
+    assert(file_count > 1);
+    assert(file_index < file_count);
+    switch (detail) {
+        .readable => try writer.print("file {d} of {d}\n\n", .{ file_index + 1, file_count }),
+        .all => try writer.print("FILE {d}/{d}\n", .{ file_index + 1, file_count }),
+    }
 }
 
 /// Accepts `[--dump [--all]] <path>`, with each flag at most once, in either order. Returns
@@ -164,9 +212,15 @@ fn records_process(
     assert(data_counts.count() == 0);
     var record_counts = RecordCounts{};
 
+    var file_index = parser.file_index;
     // Bounded: every record consumes at least one byte of a data section of at most
     // file_size_max bytes.
     while (try parser.next()) |record| {
+        if (parser.file_index != file_index) {
+            assert(parser.file_index > file_index);
+            file_index = parser.file_index;
+            try file_started(parser, dump);
+        }
         switch (record) {
             .definition => |definition| {
                 record_counts.definition += 1;
@@ -473,6 +527,43 @@ fn date_time_write(writer: *std.Io.Writer, date_time: u32, zone: Zone) !void {
 }
 
 const testing = std.testing;
+
+test "file_header_write: numbered from 1, and the longest line fits" {
+    var buffer: [file_header_line_size_max]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    const header = fitz.FileHeader{
+        .header_size = 12,
+        .protocol_version = 16,
+        .profile_version = 100,
+        .data_size = 757,
+        .crc = null,
+    };
+    try file_header_write(&writer, &header, 0xa1d5, 0, 2);
+    const expected = "FIT file 1/2: header_size=12 protocol_version=16 profile_version=100 " ++
+        "data_size=757 header_crc=absent file_crc=ok(0xa1d5)\n\n";
+    try testing.expectEqualStrings(expected, writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    const max = std.math.maxInt;
+    const header_max = fitz.FileHeader{
+        .header_size = max(u8),
+        .protocol_version = max(u8),
+        .profile_version = max(u16),
+        .data_size = max(u32),
+        .crc = max(u16),
+    };
+    try file_header_write(&writer, &header_max, max(u16), max(u32) - 1, max(u32));
+}
+
+test "file_marker_write: a block when readable, a line when full" {
+    var buffer: [32]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try file_marker_write(&writer, 0, 2, .readable);
+    try testing.expectEqualStrings("file 1 of 2\n\n", writer.buffered());
+    writer = std.Io.Writer.fixed(&buffer);
+    try file_marker_write(&writer, 1, 2, .all);
+    try testing.expectEqualStrings("FILE 2/2\n", writer.buffered());
+}
 
 test "options_parse" {
     const plain = options_parse(&.{ "fitz", "a.fit" }).?;

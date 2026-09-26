@@ -22,8 +22,9 @@ zig build run -- --dump --all path/to/file.fit > dump-all.txt
 CI (`.github/workflows/ci.yml`) runs `zig fmt --check`, the 100-column limit, and the build
 and tests in Debug and ReleaseSafe on Linux, macOS and Windows.
 
-Without flags the CLI prints the header and a per-message-type count
-summary to stderr. `--dump` also writes each data message to stdout as a
+Without flags the CLI prints a header line per file (`FIT file 1/2: …`
+for chained files) and a per-message-type count summary, covering every
+file, to stderr. `--dump` also writes each data message to stdout as a
 block meant for reading, one field per line, blocks separated by a blank
 line:
 
@@ -54,7 +55,9 @@ offset still apply. Developer fields come last, as their stored bytes:
 dump leaves them out. In both modes, arrays are in brackets, strings quoted
 and byte fields hex. A message with a compressed-timestamp header gets
 its rebuilt timestamp printed first, and the summary counts how many
-there were.
+there were. When the buffer chains several files, each one's messages
+follow a marker: a `file 2 of 3` block, or a `FILE 2/3` line with
+`--all`. An empty chained file has no marker, so its number is skipped.
 
 Targets Zig 0.16.0 (explicit `std.Io`, `std.process.Init` main,
 unmanaged containers). Only `main.zig` does I/O; `fit.zig` parses an
@@ -125,8 +128,8 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 - Verifies CRC-16 (CRC-16/ARC, as in the FIT SDK) in `Parser.init`, for
   every chained file, before any record is returned: the 14-byte
   header's CRC when it is nonzero, and the required 2-byte file CRC
-  after the data section, which covers the header and data. The CLI prints `files=N` and the first
-  file's `header_crc=ok|absent file_crc=ok(0x…)`
+  after the data section, which covers the header and data. The CLI prints each file's
+  `header_crc=ok|absent file_crc=ok(0x…)`
 - A small built-in profile (`fitz.profile`): names for well-known global
   messages, and name, units, scale and offset for the common fields of
   file_id, file_creator, device_info, event, record, lap, session and
