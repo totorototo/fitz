@@ -7,10 +7,25 @@ const file_size_max = 64 * 1024 * 1024;
 
 const usage =
     \\usage: fitz [--dump] <file.fit>
-    \\  --dump  print every data message's decoded fields to stdout
+    \\  --dump  print every data message's decoded fields to stdout; well-known
+    \\          messages and fields are named, scaled and given units
     \\  via build: zig build run -- [--dump] <file.fit>
     \\
 ;
+
+/// Prints a global message number as its profile name when one is known, else as the number.
+/// It is a `format` method, used through `{f}`, so the stderr summary and the stdout dump
+/// share one rule instead of branching at every print site.
+const MessageLabel = struct {
+    global_message_number: u16,
+
+    pub fn format(self: MessageLabel, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const name = fitz.profile.message_name(self.global_message_number) orelse
+            return writer.print("{d}", .{self.global_message_number});
+        assert(name.len > 0);
+        try writer.writeAll(name);
+    }
+};
 
 const Options = struct {
     dump: bool,
@@ -108,10 +123,10 @@ fn records_process(
             .definition => |definition| {
                 definition_count += 1;
                 std.debug.print(
-                    "DEF  local={d} global_msg={d} fields={d} big_endian={}\n",
+                    "DEF  local={d} global_msg={f} fields={d} big_endian={}\n",
                     .{
                         definition.local_message_type,
-                        definition.global_message_number,
+                        MessageLabel{ .global_message_number = definition.global_message_number },
                         definition.fields.len,
                         definition.big_endian,
                     },
@@ -138,8 +153,8 @@ fn counts_print(
     while (iterator.next()) |entry| {
         assert(entry.value_ptr.* > 0);
         std.debug.print(
-            "global_msg={d}: {d} messages\n",
-            .{ entry.key_ptr.*, entry.value_ptr.* },
+            "global_msg={f}: {d} messages\n",
+            .{ MessageLabel{ .global_message_number = entry.key_ptr.* }, entry.value_ptr.* },
         );
         data_count_total += entry.value_ptr.*;
     }
@@ -147,11 +162,12 @@ fn counts_print(
     std.debug.print("{d} data messages total\n", .{data_count_total});
 }
 
-/// One line per data message: `DATA local=L global_msg=G number=value ...`.
+/// One line per data message: `DATA local=L global_msg=G field=value ...`, where G and each
+/// field are named when the profile knows them.
 fn data_message_write(writer: *std.Io.Writer, data: *const fitz.DataMessage) !void {
-    try writer.print("DATA local={d} global_msg={d}", .{
+    try writer.print("DATA local={d} global_msg={f}", .{
         data.local_message_type,
-        data.global_message_number,
+        MessageLabel{ .global_message_number = data.global_message_number },
     });
 
     var fields_written: usize = 0;
@@ -159,33 +175,62 @@ fn data_message_write(writer: *std.Io.Writer, data: *const fitz.DataMessage) !vo
     // Bounded by the definition's field count, at most 255.
     while (iterator.next()) |field| {
         try writer.writeByte(' ');
-        try field_write(writer, &field);
+        try field_write(writer, &field, data.global_message_number);
         fields_written += 1;
     }
     assert(fields_written == data.fields.len);
     try writer.writeByte('\n');
 }
 
-/// `number=value` for a single element, `number=[a,b,...]` for an array.
-fn field_write(writer: *std.Io.Writer, field: *const fitz.Field) !void {
+/// `name=value` for a single element, `name=[a,b,...]` for an array, followed by the units.
+/// A field the profile doesn't know is printed by number, raw and without units.
+fn field_write(writer: *std.Io.Writer, field: *const fitz.Field, global_message_number: u16) !void {
     const element_count = field.element_count();
     assert(element_count >= 1);
+    const field_profile = fitz.profile.field_profile(
+        global_message_number,
+        field.field_definition_number,
+    );
+    const profile_pointer: ?*const fitz.profile.FieldProfile =
+        if (field_profile) |*profile| profile else null;
 
-    try writer.print("{d}=", .{field.field_definition_number});
-    if (element_count == 1) return value_write(writer, field.element(0));
-
-    try writer.writeByte('[');
-    var index: u8 = 0;
-    while (index < element_count) : (index += 1) {
-        if (index > 0) try writer.writeByte(',');
-        try value_write(writer, field.element(index));
+    if (field_profile) |profile| {
+        try writer.writeAll(profile.name);
+    } else {
+        try writer.print("{d}", .{field.field_definition_number});
     }
-    try writer.writeByte(']');
+    try writer.writeByte('=');
+
+    if (element_count == 1) {
+        // A single "no data" value gets no units: `heart_rate=-`, not `heart_rate=-bpm`.
+        const value = field.element(0) orelse return writer.writeByte('-');
+        try element_write(writer, value, profile_pointer);
+    } else {
+        try writer.writeByte('[');
+        var index: u8 = 0;
+        while (index < element_count) : (index += 1) {
+            if (index > 0) try writer.writeByte(',');
+            try element_write(writer, field.element(index), profile_pointer);
+        }
+        try writer.writeByte(']');
+    }
+    if (field_profile) |profile| try writer.writeAll(profile.units);
 }
 
 /// Invalid (sentinel) elements print as `-`, so "no data" never looks like a real number.
-fn value_write(writer: *std.Io.Writer, value: ?fitz.Value) !void {
+/// A scaled field prints its physical value; everything else prints the raw value exactly.
+fn element_write(
+    writer: *std.Io.Writer,
+    value: ?fitz.Value,
+    field_profile: ?*const fitz.profile.FieldProfile,
+) !void {
     const present = value orelse return writer.writeByte('-');
+    if (field_profile) |profile| {
+        if (profile.is_scaled()) {
+            // A string or byte value has nothing to scale, so it falls through to the raw form.
+            if (profile.scaled(present)) |scaled| return writer.print("{d}", .{scaled});
+        }
+    }
     switch (present) {
         .unsigned => |unsigned| try writer.print("{d}", .{unsigned}),
         .signed => |signed| try writer.print("{d}", .{signed}),
@@ -217,7 +262,7 @@ test "options_parse" {
     );
 }
 
-test "value_write: every representation and the invalid marker" {
+test "element_write: every representation and the invalid marker" {
     var buffer: [64]u8 = undefined;
     const cases = [_]struct { value: ?fitz.Value, expected: []const u8 }{
         .{ .value = null, .expected = "-" },
@@ -229,31 +274,80 @@ test "value_write: every representation and the invalid marker" {
     };
     for (cases) |case| {
         var writer = std.Io.Writer.fixed(&buffer);
-        try value_write(&writer, case.value);
+        try element_write(&writer, case.value, null);
         try testing.expectEqualStrings(case.expected, writer.buffered());
     }
 }
 
-test "data_message_write: scalars, arrays and invalid elements" {
-    const fields = [_]fitz.FieldDefinition{
-        .{ .field_definition_number = 253, .size = 4, .base_type = .uint32 },
-        .{ .field_definition_number = 5, .size = 3, .base_type = .uint8 },
-        .{ .field_definition_number = 7, .size = 2, .base_type = .sint16 },
-    };
+const test_fields = [_]fitz.FieldDefinition{
+    .{ .field_definition_number = 253, .size = 4, .base_type = .uint32 },
+    .{ .field_definition_number = 5, .size = 3, .base_type = .uint8 },
+    .{ .field_definition_number = 7, .size = 2, .base_type = .sint16 },
+    .{ .field_definition_number = 200, .size = 1, .base_type = .uint8 },
+};
+const test_raw = [_]u8{ 1, 0, 0, 0, 7, 0xFF, 9, 0xFF, 0x7F, 42 };
+
+test "data_message_write: an unknown message prints numbers and raw values" {
     const data = fitz.DataMessage{
         .local_message_type = 1,
-        .global_message_number = 20,
+        .global_message_number = 325,
         .big_endian = false,
-        .fields = &fields,
-        .raw = &.{ 1, 0, 0, 0, 7, 0xFF, 9, 0xFF, 0x7F },
+        .fields = &test_fields,
+        .raw = &test_raw,
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try data_message_write(&writer, &data);
     try testing.expectEqualStrings(
-        "DATA local=1 global_msg=20 253=1 5=[7,-,9] 7=-\n",
+        "DATA local=1 global_msg=325 253=1 5=[7,-,9] 7=- 200=42\n",
         writer.buffered(),
     );
+}
+
+test "data_message_write: a known message prints names, scaled values and units" {
+    // Same bytes as a record message: 253 is timestamp (s), 5 is distance (scale 100, m),
+    // 7 is power (W, here "no data"), and 200 is not in the table.
+    const data = fitz.DataMessage{
+        .local_message_type = 1,
+        .global_message_number = 20,
+        .big_endian = false,
+        .fields = &test_fields,
+        .raw = &test_raw,
+    };
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &data);
+    try testing.expectEqualStrings(
+        "DATA local=1 global_msg=record timestamp=1s distance=[0.07,-,0.09]m power=- 200=42\n",
+        writer.buffered(),
+    );
+}
+
+test "element_write: scaled values, and a string in a scaled field" {
+    const altitude = fitz.profile.field_profile(20, 78).?;
+    var buffer: [64]u8 = undefined;
+
+    var writer = std.Io.Writer.fixed(&buffer);
+    try element_write(&writer, .{ .unsigned = 6460 }, &altitude);
+    try testing.expectEqualStrings("792", writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try element_write(&writer, .{ .string = "odd" }, &altitude);
+    try testing.expectEqualStrings("\"odd\"", writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try element_write(&writer, null, &altitude);
+    try testing.expectEqualStrings("-", writer.buffered());
+}
+
+test "MessageLabel: name when known, number otherwise" {
+    var buffer: [32]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writer.print("{f} {f}", .{
+        MessageLabel{ .global_message_number = 18 },
+        MessageLabel{ .global_message_number = std.math.maxInt(u16) },
+    });
+    try testing.expectEqualStrings("session 65535", writer.buffered());
 }
 
 test "data_message_write: a message with no fields" {
@@ -267,5 +361,5 @@ test "data_message_write: a message with no fields" {
     var buffer: [64]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try data_message_write(&writer, &data);
-    try testing.expectEqualStrings("DATA local=0 global_msg=0\n", writer.buffered());
+    try testing.expectEqualStrings("DATA local=0 global_msg=file_id\n", writer.buffered());
 }

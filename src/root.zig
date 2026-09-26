@@ -1,5 +1,8 @@
 const fit = @import("fit.zig");
 
+/// Names, units, scale and offset for well-known messages and fields.
+pub const profile = @import("profile.zig");
+
 pub const FitError = fit.FitError;
 pub const FileHeader = fit.FileHeader;
 pub const RecordHeader = fit.RecordHeader;
@@ -17,4 +20,5 @@ pub const Parser = fit.Parser;
 
 test {
     _ = fit;
+    _ = profile;
 }

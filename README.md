@@ -17,9 +17,16 @@ zig build run -- --dump path/to/file.fit > dump.txt
 
 Without flags the CLI prints the header and a per-message-type count
 summary to stderr. `--dump` also writes one line per data message to
-stdout, e.g. `DATA local=3 global_msg=20 253=1156215827 3=91 39=- 5=[7,-,9]`:
-`field_number=value`, arrays in brackets, strings quoted, byte fields as
-hex, and `-` for a base type's invalid ("no data") sentinel.
+stdout, e.g.
+
+```
+DATA local=3 global_msg=record timestamp=1147594034s enhanced_altitude=1241.8m heart_rate=146bpm vertical_oscillation=- 140=0
+```
+
+Fields the built-in profile knows print as `name=value` plus units, with
+scale and offset applied. Unknown messages and fields keep their numbers
+and raw values. Arrays are in brackets, strings quoted, byte fields hex,
+and `-` marks a base type's invalid ("no data") sentinel.
 
 Targets Zig 0.16.0 (explicit `std.Io`, `std.process.Init` main,
 unmanaged containers). Only `main.zig` does I/O; `fit.zig` parses an
@@ -67,12 +74,18 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   whose size is a multiple of the base type size are arrays.
 - Streaming `Parser.next()` — no upfront allocation of the whole record
   list, only definition field tables are heap-allocated
+- A small built-in profile (`fitz.profile`): names for well-known global
+  messages, and name, units, scale and offset for the common fields of
+  file_id, file_creator, device_info, event, record, lap, session and
+  activity. `message_name(global)`, `field_profile(global, field)`, and
+  `FieldProfile.scaled(value)` = raw / scale − offset
 
 ## What it deliberately doesn't do yet
 
-- No profile: values are typed but unnamed and unscaled. Field numbers
-  aren't resolved against the FIT message/field profile (e.g. global_msg
-  20 isn't yet labeled "record", field 253 isn't yet labeled "timestamp")
+- Only a curated slice of the FIT profile, not the full generated one.
+  Enum values stay numeric (`sport=1`, not `running`), timestamps stay
+  seconds since the FIT epoch (1989-12-31 UTC), and positions stay in
+  semicircles rather than degrees
 - Strict on base types: a non-canonical base type byte (e.g. `0x04`
   instead of `0x84`) or a field size that isn't a multiple of its base
   type size is rejected, where the FIT SDK falls back to a byte array
@@ -86,12 +99,9 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 
 ## Rough next steps
 
-1. A small table of well-known global message numbers / field numbers
-   (record, session, lap, event, device_info — whatever your dataset
-   actually uses) rather than the full FIT SDK profile
-2. Compressed-timestamp reconstruction
-3. CRC-16 validation (file header CRC and trailing file CRC)
-4. Developer field definitions
+1. Compressed-timestamp reconstruction
+2. CRC-16 validation (file header CRC and trailing file CRC)
+3. Developer field definitions
 
 ## Layout
 
@@ -100,6 +110,7 @@ build.zig / build.zig.zon
 src/
   fit.zig    core parser (Parser, FileHeader, DefinitionMessage, DataMessage, Record)
              and base-type decoding (BaseType, FieldIterator, Field, Value)
+  profile.zig  curated FIT profile slice: message/field names, units, scale, offset
   root.zig   library re-exports (`@import("fitz")`)
   main.zig   CLI: header info, per-message-type counts, `--dump` of decoded fields
 ```
