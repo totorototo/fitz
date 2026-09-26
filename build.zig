@@ -48,6 +48,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const lib_tests = b.addTest(.{ .root_module = fitz_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
+    // The CLI's snapshot tests dump a few fixtures. Only test code embeds them, so the fitz
+    // binary doesn't grow.
+    for (snapshot_fixtures) |fixture| {
+        exe.root_module.addAnonymousImport(fixture, .{
+            .root_source_file = b.path(b.fmt("testdata/{s}", .{fixture})),
+        });
+    }
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
@@ -84,4 +91,11 @@ const fixtures = [_][]const u8{
     "compressed-speed-distance.fit",
     "coros-pace-2-cycling-misaligned-fields.fit",
     "sample_mulitple_header.fit",
+};
+
+/// Files in testdata/ whose dump src/main.zig compares with src/snapshots/.
+const snapshot_fixtures = [_][]const u8{
+    "Activity.fit",
+    "DeveloperData.fit",
+    "activity-settings.fit",
 };

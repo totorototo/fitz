@@ -197,8 +197,27 @@ src/
   root.zig   library re-exports (`@import("fitz")`)
   main.zig   CLI: header info, per-message-type counts, `--dump` of decoded fields
   fixtures_test.zig  tests against the real files in testdata/
+  snapshots/  approved CLI dumps of a few fixtures, compared by main.zig's tests
 testdata/    third-party FIT fixtures (python-fitparse, MIT); see testdata/README.md
 tools/profile_generate.py  regenerates src/profile_generated.zig
+```
+
+## Snapshots
+
+`src/snapshots/` holds the `--dump` and `--dump --all` output of a few
+fixtures, and a test compares the dump with them byte for byte. They catch
+unintended output changes, such as a profile regeneration renaming a field.
+They show what fitz printed when someone last reviewed the output, not what
+is correct; correctness is checked in `fixtures_test.zig`. When a change to
+the output is intended, regenerate them and review the diff:
+
+```sh
+zig build
+for f in Activity DeveloperData activity-settings; do
+  zig-out/bin/fitz --dump testdata/$f.fit > src/snapshots/$f.dump.txt
+  zig-out/bin/fitz --dump --all testdata/$f.fit > src/snapshots/$f.dump-all.txt
+done
+git diff src/snapshots
 ```
 
 ## Regenerating the profile
@@ -216,5 +235,5 @@ zig fmt src/profile_generated.zig
 zig build test --summary all
 ```
 
-Then review the diff: renamed fields or changed units show up in the
-dump.
+Then review the diff. Renamed fields or changed units fail the snapshot
+tests; regenerate the snapshots as above once the change is intended.

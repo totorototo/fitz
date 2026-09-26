@@ -1,2 +1,4 @@
 # Fixtures are embedded byte for byte, so a Windows checkout must not rewrite line endings.
 testdata/** -text
+# Snapshots are compared byte for byte with the dump, which always ends lines with \n.
+src/snapshots/** -text

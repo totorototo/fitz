@@ -1,0 +1,38 @@
+file_id
+  manufacturer          dynastream
+  type                  activity
+  product               9001
+  serial_number         1701
+
+developer_data_id
+  application_id        0x0101020305080d1522375990e97962db
+  developer_data_index  0
+
+field_description
+  developer_data_index  0
+  field_definition_number 0
+  fit_base_type_id      sint8
+  field_name            "doughnuts_earned"
+  units                 "doughnuts"
+
+record
+  heart_rate            140 bpm
+  cadence               88 rpm
+  distance              510 m
+  speed                 47.488 m/s
+  doughnuts_earned      1 doughnuts
+
+record
+  heart_rate            143 bpm
+  cadence               90 rpm
+  distance              2080 m
+  speed                 36.416 m/s
+  doughnuts_earned      2 doughnuts
+
+record
+  heart_rate            144 bpm
+  cadence               92 rpm
+  distance              3710 m
+  speed                 35.344 m/s
+  doughnuts_earned      3 doughnuts
+

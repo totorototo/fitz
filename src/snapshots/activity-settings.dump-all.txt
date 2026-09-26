@@ -1,0 +1,27 @@
+FILE 1/2
+DATA local=0 global_msg=file_id serial_number=2147483647 time_created=702940946s manufacturer=15 product=1 type=4
+DATA local=0 global_msg=file_creator software_version=240
+DATA local=1 global_msg=event timestamp=702940946s data=0 event=0 event_type=0 event_group=0
+DATA local=2 global_msg=record timestamp=702940946s position_lat=495280430semicircles position_long=-872696681semicircles distance=0.02m altitude=278.2m speed=0m/s
+DATA local=2 global_msg=record timestamp=702940947s position_lat=495280430semicircles position_long=-872696680semicircles distance=0.02m altitude=278.2m speed=0m/s
+DATA local=2 global_msg=record timestamp=702940948s position_lat=495280430semicircles position_long=-872696680semicircles distance=0.02m altitude=278.2m speed=0m/s
+DATA local=2 global_msg=record timestamp=702940949s position_lat=495280441semicircles position_long=-872696702semicircles distance=0.21m altitude=278.2m speed=0m/s
+DATA local=2 global_msg=record timestamp=702940950s position_lat=495280448semicircles position_long=-872696711semicircles distance=0.28m altitude=278.2m speed=0m/s
+DATA local=2 global_msg=record timestamp=702940951s position_lat=495280454semicircles position_long=-872696718semicircles distance=0.35m altitude=278.2m speed=0m/s
+DATA local=2 global_msg=record timestamp=702940952s position_lat=495280458semicircles position_long=-872696724semicircles distance=0.41m altitude=278.2m speed=0m/s
+DATA local=2 global_msg=record timestamp=702940953s position_lat=495280503semicircles position_long=-872696812semicircles distance=1.14m altitude=278.2m speed=0m/s
+DATA local=2 global_msg=record timestamp=702940954s position_lat=495280525semicircles position_long=-872696908semicircles distance=1.85m altitude=278.2m speed=0.092m/s
+DATA local=2 global_msg=record timestamp=702940955s position_lat=495280558semicircles position_long=-872697028semicircles distance=2.75m altitude=278.2m speed=0.152m/s
+DATA local=2 global_msg=record timestamp=702940956s position_lat=495280588semicircles position_long=-872697129semicircles distance=3.51m altitude=278.2m speed=0.209m/s
+DATA local=2 global_msg=record timestamp=702940957s position_lat=495280554semicircles position_long=-872697223semicircles distance=4.22m altitude=278.2m speed=0.262m/s
+DATA local=2 global_msg=record timestamp=702940958s position_lat=495280479semicircles position_long=-872697203semicircles distance=4.93m altitude=278.2m speed=0.307m/s
+DATA local=2 global_msg=record timestamp=702940959s position_lat=495280402semicircles position_long=-872697257semicircles distance=5.73m altitude=278.2m speed=0.368m/s
+DATA local=1 global_msg=event timestamp=702940959s data=0 event=0 event_type=4 event_group=0
+DATA local=3 global_msg=lap timestamp=702941091s start_time=702940946s start_position_lat=495280430semicircles start_position_long=-872696681semicircles end_position_lat=495280402semicircles end_position_long=-872697257semicircles total_elapsed_time=13.749s total_timer_time=13.749s total_distance=5.73m message_index=0 total_calories=0kcal total_fat_calories=0kcal avg_speed=0.417m/s max_speed=0.368m/s total_ascent=0m total_descent=0m event=9 event_type=1 lap_trigger=7 sport=1
+DATA local=1 global_msg=event timestamp=702941091s data=1 event=8 event_type=9 event_group=1
+DATA local=4 global_msg=session timestamp=702941091s start_time=702940946s start_position_lat=495280430semicircles start_position_long=-872696681semicircles total_elapsed_time=13.749s total_timer_time=13.749s total_distance=5.73m message_index=0 total_calories=0kcal total_fat_calories=0kcal avg_speed=0.417m/s max_speed=0.368m/s total_ascent=0m total_descent=0m first_lap_index=0 num_laps=1 event=9 event_type=1 sport=1 sub_sport=0 trigger=0
+DATA local=5 global_msg=activity timestamp=702941091s total_timer_time=13.749s local_timestamp=702926691s num_sessions=1 type=0 event=26 event_type=1
+FILE 2/2
+DATA local=0 global_msg=file_id manufacturer=1 product=988 serial_number=123456 type=2
+DATA local=0 global_msg=user_profile weight=90kg gender=1 age=28years height=1.9m language=0
+DATA local=0 global_msg=hrm_profile hrm_ant_id=100

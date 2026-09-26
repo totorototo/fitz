@@ -21,6 +21,10 @@ at a time, not all at once.
   name (list them in `build.zig` `fixtures`). Expected values must come from outside fitz
   (fitparse's tests/CSV, or cross-checks within the file), not from fitz's own output. Never
   commit personal recordings (GPS and health data).
+- `src/snapshots/`: approved CLI dumps of a few fixtures (`build.zig` `snapshot_fixtures`),
+  compared by a test in `main.zig`. The one place where fitz's own output is the expected
+  value: they catch regressions, they don't prove correctness. Regenerate them with the CLI
+  (README, "Snapshots") only for an intended output change, and review the diff.
 - **Current scope**: file header, chained files in one buffer (all verified in `Parser.init`,
   each with its own definitions; `file_index`/`file_count`, and `next_in_file`/`file_advance`
   to stop at each file), header and file CRC-16

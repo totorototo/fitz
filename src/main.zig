@@ -99,35 +99,32 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
+    // Unbuffered, like std.debug.print: progress lines appear even if a later record fails.
+    var stderr_writer = std.Io.File.stderr().writer(io, &.{});
+    const log = &stderr_writer.interface;
+
     var data_counts = std.AutoHashMap(u16, u32).init(allocator);
     defer data_counts.deinit();
     assert(parser.file_index == 0);
-    const record_counts = try records_process(&parser, dump, &data_counts);
+    const record_counts = try records_process(&parser, dump, log, &data_counts);
     if (dump) |active| try active.writer.flush();
 
-    counts_print(&record_counts, &data_counts, buffer.len);
+    try counts_write(log, &record_counts, &data_counts, buffer.len);
 }
 
-/// Announces the file the parser is in: its header line on stderr and, when the buffer chains
-/// several files, a marker in the dump. Called as the parser enters each file, before its
-/// records, so an empty chained file is announced too.
-fn file_started(parser: *const fitz.Parser, dump: ?Dump) !void {
+/// Announces the file the parser is in: its header line in the log (stderr) and, when the
+/// buffer chains several files, a marker in the dump. Called as the parser enters each file,
+/// before its records, so an empty chained file is announced too.
+fn file_started(parser: *const fitz.Parser, dump: ?Dump, log: *std.Io.Writer) !void {
     assert(parser.file_index < parser.file_count);
-    var line_buffer: [file_header_line_size_max]u8 = undefined;
-    var line: std.Io.Writer = .fixed(&line_buffer);
-    // A test checks that the longest possible line fits.
     const header = &parser.header;
-    file_header_write(&line, header, parser.file_crc, parser.file_index, parser.file_count) catch
-        unreachable;
-    std.debug.print("{s}", .{line.buffered()});
+    try file_header_write(log, header, parser.file_crc, parser.file_index, parser.file_count);
 
     const active = dump orelse return;
     if (parser.file_count > 1) {
         try file_marker_write(active.writer, parser.file_index, parser.file_count, active.detail);
     }
 }
-
-const file_header_line_size_max = 160;
 
 /// `FIT file N/M: header_size=… file_crc=ok(0x…)`, then a blank line. N counts from 1.
 fn file_header_write(
@@ -204,9 +201,12 @@ fn options_parse(arguments: []const [:0]const u8) ?Options {
     return options;
 }
 
+/// Reads every record of every file, writing the dump (if any) and, to `log`, a header line per
+/// file and a line per definition.
 fn records_process(
     parser: *fitz.Parser,
     dump: ?Dump,
+    log: *std.Io.Writer,
     data_counts: *std.AutoHashMap(u16, u32),
 ) !RecordCounts {
     assert(data_counts.count() == 0);
@@ -214,9 +214,9 @@ fn records_process(
 
     // Bounded by the file count, and each file's records by its data size.
     while (true) {
-        try file_started(parser, dump);
+        try file_started(parser, dump, log);
         while (try parser.next_in_file()) |record| {
-            try record_process(parser, &record, dump, data_counts, &record_counts);
+            try record_process(parser, &record, dump, log, data_counts, &record_counts);
         }
         if (!parser.file_advance()) break;
     }
@@ -230,6 +230,7 @@ fn record_process(
     parser: *const fitz.Parser,
     record: *const fitz.Record,
     dump: ?Dump,
+    log: *std.Io.Writer,
     data_counts: *std.AutoHashMap(u16, u32),
     record_counts: *RecordCounts,
 ) !void {
@@ -237,7 +238,7 @@ fn record_process(
     switch (record.*) {
         .definition => |definition| {
             record_counts.definition += 1;
-            std.debug.print(
+            try log.print(
                 "DEF  local={d} global_msg={f} fields={d} developer_fields={d} " ++
                     "big_endian={}\n",
                 .{
@@ -265,17 +266,18 @@ fn record_process(
     }
 }
 
-fn counts_print(
+fn counts_write(
+    log: *std.Io.Writer,
     record_counts: *const RecordCounts,
     data_counts: *const std.AutoHashMap(u16, u32),
     buffer_len: usize,
-) void {
-    std.debug.print("\n{d} definition messages\n", .{record_counts.definition});
+) !void {
+    try log.print("\n{d} definition messages\n", .{record_counts.definition});
     var data_count_total: u64 = 0;
     var iterator = data_counts.iterator();
     while (iterator.next()) |entry| {
         assert(entry.value_ptr.* > 0);
-        std.debug.print(
+        try log.print(
             "global_msg={f}: {d} messages\n",
             .{ MessageLabel{ .global_message_number = entry.key_ptr.* }, entry.value_ptr.* },
         );
@@ -284,7 +286,7 @@ fn counts_print(
     assert(data_count_total <= buffer_len);
     assert(record_counts.compressed_timestamp <= data_count_total);
     assert(record_counts.developer_fields <= data_count_total);
-    std.debug.print(
+    try log.print(
         "{d} data messages total, {d} with a compressed timestamp, {d} with developer fields\n",
         .{
             data_count_total,
@@ -677,8 +679,8 @@ const testing = std.testing;
 /// For messages without developer fields, or whose developer fields the file doesn't describe.
 const no_descriptions = fitz.DeveloperFieldDescriptions{};
 
-test "file_header_write: numbered from 1, and the longest line fits" {
-    var buffer: [file_header_line_size_max]u8 = undefined;
+test "file_header_write: numbered from 1, and the largest values" {
+    var buffer: [160]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     const header = fitz.FileHeader{
         .header_size = 12,
@@ -1272,4 +1274,34 @@ test "data_message_write: readable detail names enumerated values, full detail k
     try data_message_write(&writer, &data, &no_descriptions, .all);
     const line = "DATA local=0 global_msg=session sport=1 sub_sport=200\n";
     try testing.expectEqualStrings(line, writer.buffered());
+}
+
+/// Runs the dump the CLI would print for `fit_file`, and compares it with an approved snapshot.
+/// Snapshots catch unintended output changes, such as a profile regeneration renaming a field;
+/// they are regression checks, not proof of correctness, which fixtures_test.zig checks against
+/// values from outside fitz. The header and definition lines go to the discarded log.
+fn snapshot_expect(fit_file: []const u8, detail: DumpDetail, expected: []const u8) !void {
+    var parser = try fitz.Parser.init(testing.allocator, fit_file);
+    defer parser.deinit();
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+    var log_buffer: [64]u8 = undefined;
+    var log: std.Io.Writer.Discarding = .init(&log_buffer);
+    var data_counts = std.AutoHashMap(u16, u32).init(testing.allocator);
+    defer data_counts.deinit();
+
+    const dump = Dump{ .writer = &output.writer, .detail = detail };
+    const record_counts = try records_process(&parser, dump, &log.writer, &data_counts);
+    assert(record_counts.definition > 0);
+    try testing.expectEqualStrings(expected, output.written());
+}
+
+test "snapshots: the dump of real files matches src/snapshots/" {
+    const names = [_][]const u8{ "Activity", "DeveloperData", "activity-settings" };
+    inline for (names) |name| {
+        const fit_file = @embedFile(name ++ ".fit");
+        try snapshot_expect(fit_file, .readable, @embedFile("snapshots/" ++ name ++ ".dump.txt"));
+        const all = @embedFile("snapshots/" ++ name ++ ".dump-all.txt");
+        try snapshot_expect(fit_file, .all, all);
+    }
 }
