@@ -11,9 +11,11 @@ at a time, not all at once.
   `--dump` is for reading (a block per message, known fields with data, dates and degrees);
   `--dump --all` is one grep-able line per message with every field as stored. Both decode
   developer fields the file describes (field_description, 206).
-- `src/profile.zig`: a hand-written slice of the FIT profile (names, units, scale, offset),
-  exported as `fitz.profile`. Pure lookups. Add a field only after checking it against a real
-  file (e.g. totals that must agree), not from memory alone.
+- `src/profile.zig`: FIT profile lookups (names, units, scale, offset, enum value names),
+  exported as `fitz.profile`. Pure lookups over `src/profile_generated.zig`, which
+  `tools/profile_generate.py` generates from Garmin's FIT Python SDK (see README). Never edit
+  the generated file by hand: fix the generator and regenerate. It is Garmin-derived (FIT
+  Protocol License), so keep its header notice.
 - `src/root.zig`: the library entry point.
 - `src/fixtures_test.zig` + `testdata/`: tests against real third-party FIT files, embedded by
   name (list them in `build.zig` `fixtures`). Expected values must come from outside fitz
@@ -24,12 +26,12 @@ at a time, not all at once.
   verification, normal and compressed-timestamp record headers (compressed timestamps are rebuilt against
   the latest field 253), definition messages, and data messages with base-type value decoding
   (`Field.element` returns a typed `Value`, or null for the base type's invalid sentinel).
-  Well-known messages and fields are named, scaled and given units by `profile.zig`.
+  Messages, fields and enumerated values are named, scaled and given units by `profile.zig`.
   Developer field definitions are parsed and each data message's developer fields are split out
   as raw bytes. Each file's field_description (206) messages are collected in
   `Parser.developer_field_descriptions` (base type, name, units, scale, offset), and
   `DeveloperField.field(base_type)` decodes a field once its description is known.
-- **Not yet supported**: the full FIT profile (enum value names), a field_description's array,
+- **Not yet supported**: profile subfields and components, and a field_description's array,
   components and native-field entries.
 - **Error policy**: `FitError` is for invalid external bytes. An `assert` is for parser invariants,
   so a failed assert means a bug in fitz, never a bad file.

@@ -1,7 +1,7 @@
-//! A small, hand-written slice of the FIT profile: names for well-known global message
-//! numbers, and name, units, scale and offset for the common fields of the messages an
-//! activity file is built from. It is not the full generated profile, which has thousands of
-//! fields and belongs in a code generator. Pure lookups, no allocation.
+//! The FIT profile: names for global message numbers, name, units, scale and offset for their
+//! fields, and names for the values of enumerated fields. The tables are generated from
+//! Garmin's FIT SDK into profile_generated.zig; this file holds the lookups and conversions.
+//! Subfields and components are not applied yet. Pure lookups, no allocation.
 //!
 //! FIT scaling: physical value = raw / scale - offset. Dates and positions are not scaled but
 //! converted, and `FieldProfile.kind` says which conversion applies.
@@ -9,6 +9,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const fit = @import("fit.zig");
+const generated = @import("profile_generated.zig");
+
+/// The FIT SDK profile version the tables were generated from.
+pub const version = generated.version;
 
 /// Seconds from the Unix epoch to the FIT epoch, 1989-12-31 00:00:00 UTC.
 pub const fit_epoch_unix_s: u64 = 631065600;
@@ -18,16 +22,10 @@ pub const date_time_absolute_min: u32 = 0x10000000;
 /// 2^31 semicircles make 180 degrees.
 const semicircles_per_180_degrees: f64 = 2147483648.0;
 
-pub const Kind = enum {
-    /// A plain number, scaled when the entry has a scale or offset.
-    number,
-    /// uint32 seconds since the FIT epoch, in UTC. Units are "s".
-    date_time,
-    /// The same encoding in the device's local time zone. Units are "s".
-    local_date_time,
-    /// sint32 angle. Units are "semicircles".
-    semicircles,
-};
+/// number: a plain number, scaled when the entry has a scale or offset. date_time: uint32
+/// seconds since the FIT epoch, in UTC, units "s". local_date_time: the same in the device's
+/// local time zone. semicircles: a sint32 angle, units "semicircles".
+pub const Kind = generated.Kind;
 
 /// Converts a FIT date_time to Unix seconds. Returns null for a value below
 /// `date_time_absolute_min`, which is time since power-on and has no calendar date.
@@ -51,26 +49,50 @@ pub const FieldProfile = struct {
     kind: Kind = .number,
     /// Empty when the field is dimensionless (an enum, an index, a count).
     units: []const u8 = "",
-    scale: u16 = 1,
+    /// Positive, and not always a whole number (e.g. 10430.38).
+    scale: f64 = 1,
     offset: i16 = 0,
+    /// Index into the generated types when the field's values have names.
+    type_index: ?u16 = null,
 
     pub fn is_scaled(self: *const FieldProfile) bool {
-        assert(self.scale >= 1);
+        assert(self.scale > 0);
         return self.scale != 1 or self.offset != 0;
+    }
+
+    /// The profile's name for an unsigned value (`sport` 1 is "running"), or null when the
+    /// field has no named values or this value isn't one of them. A bit-field type names only
+    /// its single bits, so a combination of them has no name.
+    pub fn value_name(self: *const FieldProfile, value: fit.Value) ?[]const u8 {
+        const type_index = self.type_index orelse return null;
+        assert(self.kind == .number);
+        const unsigned = switch (value) {
+            .unsigned => |unsigned| unsigned,
+            .signed, .float, .string, .bytes => return null,
+        };
+        const values = generated.types[type_index].values;
+        const index = std.sort.binarySearch(
+            generated.ValueName,
+            values,
+            unsigned,
+            value_order,
+        ) orelse return null;
+        assert(values[index].value == unsigned);
+        return values[index].name;
     }
 
     /// Applies scale and offset to one element. Returns null for a string or byte value: the
     /// file chose a base type the profile doesn't expect for this field, and there is no
     /// number to scale.
     pub fn scaled(self: *const FieldProfile, value: fit.Value) ?f64 {
-        assert(self.scale >= 1);
+        assert(self.scale > 0);
         const raw: f64 = switch (value) {
             .unsigned => |unsigned| @floatFromInt(unsigned),
             .signed => |signed| @floatFromInt(signed),
             .float => |float| float,
             .string, .bytes => return null,
         };
-        const scale: f64 = @floatFromInt(self.scale);
+        const scale = self.scale;
         const offset: f64 = @floatFromInt(self.offset);
         // (raw - offset * scale) / scale rather than raw / scale - offset: for integer raw
         // values the subtraction is exact, so the one division is the only rounding, and the
@@ -87,222 +109,65 @@ pub fn developer_field_profile(description: *const fit.DeveloperFieldDescription
     const profile = FieldProfile{
         .name = description.name orelse "",
         .units = description.units,
-        .scale = description.scale,
+        .scale = @floatFromInt(description.scale),
         .offset = description.offset,
     };
     assert(profile.kind == .number);
     return profile;
 }
 
-/// Returns null for a message number outside this curated subset.
+fn value_order(value: u64, entry: generated.ValueName) std.math.Order {
+    return std.math.order(value, entry.value);
+}
+
+fn message_order(number: u16, message: generated.Message) std.math.Order {
+    return std.math.order(number, message.number);
+}
+
+fn field_order(number: u8, field: generated.Field) std.math.Order {
+    return std.math.order(number, field.number);
+}
+
+fn message_find(global_message_number: u16) ?*const generated.Message {
+    const messages = &generated.messages;
+    const index = std.sort.binarySearch(
+        generated.Message,
+        messages,
+        global_message_number,
+        message_order,
+    ) orelse return null;
+    assert(messages[index].number == global_message_number);
+    return &messages[index];
+}
+
+/// Returns null for a message number the profile doesn't define.
 pub fn message_name(global_message_number: u16) ?[]const u8 {
-    return switch (global_message_number) {
-        0 => "file_id",
-        2 => "device_settings",
-        3 => "user_profile",
-        7 => "zones_target",
-        12 => "sport",
-        18 => "session",
-        19 => "lap",
-        20 => "record",
-        21 => "event",
-        23 => "device_info",
-        34 => "activity",
-        49 => "file_creator",
-        206 => "field_description",
-        207 => "developer_data_id",
-        else => null,
-    };
+    const message = message_find(global_message_number) orelse return null;
+    assert(message.name.len > 0);
+    return message.name;
 }
 
-/// Returns null when the message has no field table here, or the field isn't in it.
+/// Returns null when the message or the field isn't in the profile.
 pub fn field_profile(global_message_number: u16, field_definition_number: u8) ?FieldProfile {
-    const profile: FieldProfile = switch (global_message_number) {
-        0 => file_id(field_definition_number),
-        18 => session(field_definition_number),
-        19 => lap(field_definition_number),
-        20 => record(field_definition_number),
-        21 => event(field_definition_number),
-        23 => device_info(field_definition_number),
-        34 => activity(field_definition_number),
-        49 => file_creator(field_definition_number),
-        else => null,
-    } orelse return null;
-    // A field table only exists for a message that has a name.
-    assert(message_name(global_message_number) != null);
-    assert(profile.scale >= 1);
+    const message = message_find(global_message_number) orelse return null;
+    const index = std.sort.binarySearch(
+        generated.Field,
+        message.fields,
+        field_definition_number,
+        field_order,
+    ) orelse return null;
+    const field = &message.fields[index];
+    assert(field.number == field_definition_number);
+    const profile = FieldProfile{
+        .name = field.name,
+        .kind = field.kind,
+        .units = field.units,
+        .scale = field.scale,
+        .offset = field.offset,
+        .type_index = field.type_index,
+    };
+    assert(profile.scale > 0);
     return profile;
-}
-
-fn file_id(field_definition_number: u8) ?FieldProfile {
-    return switch (field_definition_number) {
-        0 => .{ .name = "type" },
-        1 => .{ .name = "manufacturer" },
-        2 => .{ .name = "product" },
-        3 => .{ .name = "serial_number" },
-        4 => .{ .name = "time_created", .kind = .date_time, .units = "s" },
-        5 => .{ .name = "number" },
-        8 => .{ .name = "product_name" },
-        else => null,
-    };
-}
-
-fn file_creator(field_definition_number: u8) ?FieldProfile {
-    return switch (field_definition_number) {
-        0 => .{ .name = "software_version" },
-        1 => .{ .name = "hardware_version" },
-        else => null,
-    };
-}
-
-fn device_info(field_definition_number: u8) ?FieldProfile {
-    return switch (field_definition_number) {
-        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
-        0 => .{ .name = "device_index" },
-        1 => .{ .name = "device_type" },
-        2 => .{ .name = "manufacturer" },
-        3 => .{ .name = "serial_number" },
-        4 => .{ .name = "product" },
-        5 => .{ .name = "software_version", .scale = 100 },
-        6 => .{ .name = "hardware_version" },
-        7 => .{ .name = "cum_operating_time", .units = "s" },
-        10 => .{ .name = "battery_voltage", .units = "V", .scale = 256 },
-        11 => .{ .name = "battery_status" },
-        25 => .{ .name = "source_type" },
-        27 => .{ .name = "product_name" },
-        else => null,
-    };
-}
-
-fn event(field_definition_number: u8) ?FieldProfile {
-    return switch (field_definition_number) {
-        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
-        0 => .{ .name = "event" },
-        1 => .{ .name = "event_type" },
-        2 => .{ .name = "data16" },
-        3 => .{ .name = "data" },
-        4 => .{ .name = "event_group" },
-        else => null,
-    };
-}
-
-fn record(field_definition_number: u8) ?FieldProfile {
-    return switch (field_definition_number) {
-        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
-        0 => .{ .name = "position_lat", .kind = .semicircles, .units = "semicircles" },
-        1 => .{ .name = "position_long", .kind = .semicircles, .units = "semicircles" },
-        2 => .{ .name = "altitude", .units = "m", .scale = 5, .offset = 500 },
-        3 => .{ .name = "heart_rate", .units = "bpm" },
-        4 => .{ .name = "cadence", .units = "rpm" },
-        5 => .{ .name = "distance", .units = "m", .scale = 100 },
-        6 => .{ .name = "speed", .units = "m/s", .scale = 1000 },
-        7 => .{ .name = "power", .units = "W" },
-        9 => .{ .name = "grade", .units = "%", .scale = 100 },
-        13 => .{ .name = "temperature", .units = "C" },
-        39 => .{ .name = "vertical_oscillation", .units = "mm", .scale = 10 },
-        40 => .{ .name = "stance_time_percent", .units = "%", .scale = 100 },
-        41 => .{ .name = "stance_time", .units = "ms", .scale = 10 },
-        42 => .{ .name = "activity_type" },
-        53 => .{ .name = "fractional_cadence", .units = "rpm", .scale = 128 },
-        73 => .{ .name = "enhanced_speed", .units = "m/s", .scale = 1000 },
-        78 => .{ .name = "enhanced_altitude", .units = "m", .scale = 5, .offset = 500 },
-        83 => .{ .name = "vertical_ratio", .units = "%", .scale = 100 },
-        84 => .{ .name = "stance_time_balance", .units = "%", .scale = 100 },
-        85 => .{ .name = "step_length", .units = "mm", .scale = 10 },
-        else => null,
-    };
-}
-
-fn lap(field_definition_number: u8) ?FieldProfile {
-    return switch (field_definition_number) {
-        254 => .{ .name = "message_index" },
-        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
-        0 => .{ .name = "event" },
-        1 => .{ .name = "event_type" },
-        2 => .{ .name = "start_time", .kind = .date_time, .units = "s" },
-        3 => .{ .name = "start_position_lat", .kind = .semicircles, .units = "semicircles" },
-        4 => .{ .name = "start_position_long", .kind = .semicircles, .units = "semicircles" },
-        5 => .{ .name = "end_position_lat", .kind = .semicircles, .units = "semicircles" },
-        6 => .{ .name = "end_position_long", .kind = .semicircles, .units = "semicircles" },
-        7 => .{ .name = "total_elapsed_time", .units = "s", .scale = 1000 },
-        8 => .{ .name = "total_timer_time", .units = "s", .scale = 1000 },
-        9 => .{ .name = "total_distance", .units = "m", .scale = 100 },
-        10 => .{ .name = "total_cycles", .units = "cycles" },
-        11 => .{ .name = "total_calories", .units = "kcal" },
-        13 => .{ .name = "avg_speed", .units = "m/s", .scale = 1000 },
-        14 => .{ .name = "max_speed", .units = "m/s", .scale = 1000 },
-        15 => .{ .name = "avg_heart_rate", .units = "bpm" },
-        16 => .{ .name = "max_heart_rate", .units = "bpm" },
-        17 => .{ .name = "avg_cadence", .units = "rpm" },
-        18 => .{ .name = "max_cadence", .units = "rpm" },
-        19 => .{ .name = "avg_power", .units = "W" },
-        20 => .{ .name = "max_power", .units = "W" },
-        21 => .{ .name = "total_ascent", .units = "m" },
-        22 => .{ .name = "total_descent", .units = "m" },
-        24 => .{ .name = "lap_trigger" },
-        27 => .{ .name = "nec_lat", .kind = .semicircles, .units = "semicircles" },
-        28 => .{ .name = "nec_long", .kind = .semicircles, .units = "semicircles" },
-        29 => .{ .name = "swc_lat", .kind = .semicircles, .units = "semicircles" },
-        30 => .{ .name = "swc_long", .kind = .semicircles, .units = "semicircles" },
-        25 => .{ .name = "sport" },
-        else => null,
-    };
-}
-
-fn session(field_definition_number: u8) ?FieldProfile {
-    return switch (field_definition_number) {
-        254 => .{ .name = "message_index" },
-        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
-        0 => .{ .name = "event" },
-        1 => .{ .name = "event_type" },
-        2 => .{ .name = "start_time", .kind = .date_time, .units = "s" },
-        3 => .{ .name = "start_position_lat", .kind = .semicircles, .units = "semicircles" },
-        4 => .{ .name = "start_position_long", .kind = .semicircles, .units = "semicircles" },
-        5 => .{ .name = "sport" },
-        6 => .{ .name = "sub_sport" },
-        7 => .{ .name = "total_elapsed_time", .units = "s", .scale = 1000 },
-        8 => .{ .name = "total_timer_time", .units = "s", .scale = 1000 },
-        9 => .{ .name = "total_distance", .units = "m", .scale = 100 },
-        10 => .{ .name = "total_cycles", .units = "cycles" },
-        11 => .{ .name = "total_calories", .units = "kcal" },
-        14 => .{ .name = "avg_speed", .units = "m/s", .scale = 1000 },
-        15 => .{ .name = "max_speed", .units = "m/s", .scale = 1000 },
-        16 => .{ .name = "avg_heart_rate", .units = "bpm" },
-        17 => .{ .name = "max_heart_rate", .units = "bpm" },
-        18 => .{ .name = "avg_cadence", .units = "rpm" },
-        19 => .{ .name = "max_cadence", .units = "rpm" },
-        20 => .{ .name = "avg_power", .units = "W" },
-        21 => .{ .name = "max_power", .units = "W" },
-        22 => .{ .name = "total_ascent", .units = "m" },
-        23 => .{ .name = "total_descent", .units = "m" },
-        25 => .{ .name = "first_lap_index" },
-        26 => .{ .name = "num_laps" },
-        28 => .{ .name = "trigger" },
-        29 => .{ .name = "nec_lat", .kind = .semicircles, .units = "semicircles" },
-        30 => .{ .name = "nec_long", .kind = .semicircles, .units = "semicircles" },
-        31 => .{ .name = "swc_lat", .kind = .semicircles, .units = "semicircles" },
-        32 => .{ .name = "swc_long", .kind = .semicircles, .units = "semicircles" },
-        38 => .{ .name = "end_position_lat", .kind = .semicircles, .units = "semicircles" },
-        39 => .{ .name = "end_position_long", .kind = .semicircles, .units = "semicircles" },
-        110 => .{ .name = "sport_profile_name" },
-        124 => .{ .name = "enhanced_avg_speed", .units = "m/s", .scale = 1000 },
-        125 => .{ .name = "enhanced_max_speed", .units = "m/s", .scale = 1000 },
-        else => null,
-    };
-}
-
-fn activity(field_definition_number: u8) ?FieldProfile {
-    return switch (field_definition_number) {
-        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
-        0 => .{ .name = "total_timer_time", .units = "s", .scale = 1000 },
-        1 => .{ .name = "num_sessions" },
-        2 => .{ .name = "type" },
-        3 => .{ .name = "event" },
-        4 => .{ .name = "event_type" },
-        5 => .{ .name = "local_timestamp", .kind = .local_date_time, .units = "s" },
-        6 => .{ .name = "event_group" },
-        else => null,
-    };
 }
 
 const testing = std.testing;
@@ -311,8 +176,13 @@ test "message_name: known and unknown numbers" {
     try testing.expectEqualStrings("file_id", message_name(0).?);
     try testing.expectEqualStrings("record", message_name(20).?);
     try testing.expectEqualStrings("developer_data_id", message_name(207).?);
-    try testing.expectEqual(@as(?[]const u8, null), message_name(1));
+    // The first and last messages, then gaps: between them, past the last, and the
+    // manufacturer-specific range from 0xFF00.
+    try testing.expectEqualStrings("file_id", message_name(generated.messages[0].number).?);
+    try testing.expectEqualStrings("sleep_disruption_overnight_severity", message_name(471).?);
     try testing.expectEqual(@as(?[]const u8, null), message_name(325));
+    try testing.expectEqual(@as(?[]const u8, null), message_name(472));
+    try testing.expectEqual(@as(?[]const u8, null), message_name(0xFF00));
     try testing.expectEqual(@as(?[]const u8, null), message_name(std.math.maxInt(u16)));
 }
 
@@ -323,55 +193,96 @@ test "field_profile: lookups, including edge field numbers" {
     try testing.expect(!heart_rate.is_scaled());
 
     const altitude = field_profile(20, 78).?;
-    try testing.expectEqual(@as(u16, 5), altitude.scale);
+    try testing.expectEqual(@as(f64, 5), altitude.scale);
     try testing.expectEqual(@as(i16, 500), altitude.offset);
     try testing.expect(altitude.is_scaled());
 
     try testing.expectEqualStrings("type", field_profile(0, 0).?.name);
     try testing.expectEqualStrings("message_index", field_profile(18, 254).?.name);
 
-    // Unknown field, unknown message, and a named message that has no field table.
+    // A scale that isn't a whole number.
+    try testing.expectEqual(@as(f64, 10430.38), field_profile(178, 2).?.scale);
+
+    // Unknown field (between known ones, and the largest number), and unknown message.
+    try testing.expectEqual(@as(?FieldProfile, null), field_profile(20, 14));
     try testing.expectEqual(@as(?FieldProfile, null), field_profile(20, 255));
     try testing.expectEqual(@as(?FieldProfile, null), field_profile(325, 0));
-    try testing.expectEqual(@as(?FieldProfile, null), field_profile(3, 0));
 }
 
-test "field_profile: every entry is well-formed and names are unique per message" {
-    var message_number: u32 = 0;
-    // Bounded: the whole u16 message space times the whole u8 field space.
-    while (message_number <= std.math.maxInt(u16)) : (message_number += 1) {
-        const global: u16 = @intCast(message_number);
-        if (message_name(global) == null) continue;
-
-        var field_number: u32 = 0;
-        while (field_number <= std.math.maxInt(u8)) : (field_number += 1) {
-            const profile = field_profile(global, @intCast(field_number)) orelse continue;
-            try testing.expect(profile.name.len > 0);
-            try testing.expect(profile.scale >= 1);
-            // A converted field is never also scaled, and its units describe the raw value.
-            switch (profile.kind) {
-                .number => {},
-                .date_time, .local_date_time => {
-                    try testing.expect(!profile.is_scaled());
-                    try testing.expectEqualStrings("s", profile.units);
-                },
-                .semicircles => {
-                    try testing.expect(!profile.is_scaled());
-                    try testing.expectEqualStrings("semicircles", profile.units);
-                },
+test "generated tables: sorted, unique and well-formed" {
+    for (generated.messages, 0..) |message, index| {
+        if (index > 0) try testing.expect(generated.messages[index - 1].number < message.number);
+        // A message can have no fields: pad (105) only fills space.
+        try name_expect_snake_case(message.name);
+        for (message.fields, 0..) |field, field_index| {
+            if (field_index > 0) {
+                try testing.expect(message.fields[field_index - 1].number < field.number);
             }
-            for (profile.name) |character| {
-                try testing.expect(std.ascii.isLower(character) or
-                    std.ascii.isDigit(character) or character == '_');
-            }
-
-            var other_number: u32 = field_number + 1;
-            while (other_number <= std.math.maxInt(u8)) : (other_number += 1) {
-                const other = field_profile(global, @intCast(other_number)) orelse continue;
-                try testing.expect(!std.mem.eql(u8, profile.name, other.name));
+            try field_expect_well_formed(&field);
+            for (message.fields[field_index + 1 ..]) |other| {
+                try testing.expect(!std.mem.eql(u8, field.name, other.name));
             }
         }
     }
+    for (generated.types) |value_type| {
+        try testing.expect(value_type.values.len > 0);
+        for (value_type.values[1..], 1..) |entry, index| {
+            try testing.expect(value_type.values[index - 1].value < entry.value);
+        }
+    }
+}
+
+fn field_expect_well_formed(field: *const generated.Field) !void {
+    try name_expect_snake_case(field.name);
+    try testing.expect(field.scale > 0);
+    // A converted field is never also scaled, and its units describe the raw value.
+    switch (field.kind) {
+        .number => if (field.type_index) |type_index| {
+            try testing.expect(type_index < generated.types.len);
+        },
+        .date_time, .local_date_time => {
+            try testing.expect(field.scale == 1 and field.offset == 0);
+            try testing.expectEqualStrings("s", field.units);
+            try testing.expectEqual(@as(?u16, null), field.type_index);
+        },
+        .semicircles => {
+            try testing.expect(field.scale == 1 and field.offset == 0);
+            try testing.expectEqualStrings("semicircles", field.units);
+            try testing.expectEqual(@as(?u16, null), field.type_index);
+        },
+    }
+}
+
+fn name_expect_snake_case(name: []const u8) !void {
+    try testing.expect(name.len > 0);
+    for (name) |character| {
+        try testing.expect(std.ascii.isLower(character) or
+            std.ascii.isDigit(character) or character == '_');
+    }
+}
+
+test "FieldProfile.value_name: named values, bits, and values without a name" {
+    const sport = field_profile(18, 5).?;
+    try testing.expectEqualStrings("generic", sport.value_name(.{ .unsigned = 0 }).?);
+    try testing.expectEqualStrings("running", sport.value_name(.{ .unsigned = 1 }).?);
+    try testing.expectEqualStrings("all", sport.value_name(.{ .unsigned = 254 }).?);
+    try testing.expectEqual(@as(?[]const u8, null), sport.value_name(.{ .unsigned = 253 }));
+    try testing.expectEqual(@as(?[]const u8, null), sport.value_name(.{ .signed = 1 }));
+    try testing.expectEqual(@as(?[]const u8, null), sport.value_name(.{ .string = "x" }));
+
+    // file_id.manufacturer is a uint16 type; 1 is garmin, 255 development.
+    const manufacturer = field_profile(0, 1).?;
+    try testing.expectEqualStrings("garmin", manufacturer.value_name(.{ .unsigned = 1 }).?);
+    const development = manufacturer.value_name(.{ .unsigned = 255 }).?;
+    try testing.expectEqualStrings("development", development);
+    // Past the last value of a type.
+    const past = manufacturer.value_name(.{ .unsigned = 1 << 32 });
+    try testing.expectEqual(@as(?[]const u8, null), past);
+
+    // A plain number and a date have no names; heart rate 1 isn't "running".
+    const heart_rate = field_profile(20, 3).?;
+    try testing.expectEqual(@as(?[]const u8, null), heart_rate.value_name(.{ .unsigned = 1 }));
+    try testing.expectEqual(@as(?u16, null), field_profile(20, 253).?.type_index);
 }
 
 test "FieldProfile.scaled: scale, offset and non-numeric values" {

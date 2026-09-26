@@ -301,7 +301,7 @@ fn data_message_write(
     }
 }
 
-/// Every name in the profile fits this column, which a test checks, so values line up.
+/// Most profile names fit this column, so values line up; a longer name still gets a space.
 const name_column_width = 22;
 
 /// A heading with the message name, then one indented `name  value units` line per field
@@ -328,7 +328,7 @@ fn data_message_block_write(
     // A compressed header's timestamp isn't one of the message's fields, so it is printed
     // first, where a normal message's field 253 usually is.
     if (data.compressed_timestamp) |timestamp| {
-        try writer.print("  {s:<[1]}", .{ "timestamp", name_column_width });
+        try field_name_write(writer, "timestamp");
         try date_time_write(writer, timestamp, .utc);
         try writer.writeByte('\n');
     }
@@ -341,7 +341,6 @@ fn data_message_block_write(
             data.global_message_number,
             field.field_definition_number,
         ).?;
-        assert(profile.name.len < name_column_width);
         try field_name_write(writer, profile.name);
         try field_value_write(writer, &field, &profile, .readable);
         try writer.writeByte('\n');
@@ -352,8 +351,8 @@ fn data_message_block_write(
     try writer.writeByte('\n');
 }
 
-/// Pads the name to the value column. A developer field's name comes from the file and may be
-/// longer than the column, so it still gets one space.
+/// Pads the name to the value column. A longer name (a profile name of up to 38 characters, or
+/// a developer field's name from the file) still gets one space.
 fn field_name_write(writer: *std.Io.Writer, name: []const u8) !void {
     assert(name.len >= 1);
     const width = @max(name_column_width, name.len + 1);
@@ -552,8 +551,9 @@ fn field_value_write(
 }
 
 /// Invalid (sentinel) elements print as `-`, so "no data" never looks like a real number.
-/// In readable detail, dates and positions are converted; a scaled field prints its physical
-/// value; everything else prints the raw value exactly.
+/// In readable detail, a value the profile names prints its name (`running`), and dates and
+/// positions are converted; a scaled field prints its physical value; everything else prints
+/// the raw value exactly. Full detail prints the stored number, not a name.
 fn element_write(
     writer: *std.Io.Writer,
     value: ?fitz.Value,
@@ -562,6 +562,9 @@ fn element_write(
 ) !void {
     const present = value orelse return writer.writeByte('-');
     if (field_profile) |profile| {
+        if (detail == .readable) {
+            if (profile.value_name(present)) |name| return writer.writeAll(name);
+        }
         if (detail == .readable and profile.kind != .number) {
             if (try converted_write(writer, present, profile.kind)) return;
         }
@@ -1034,18 +1037,22 @@ test "field_value_write: units follow a space in readable detail, but not in ful
     try testing.expectEqualStrings("0", writer.buffered());
 }
 
-test "name_column_width: every profile field name fits, leaving a gap" {
-    var message_number: u32 = 0;
-    // Bounded: the whole u16 message space times the whole u8 field space.
-    while (message_number <= std.math.maxInt(u16)) : (message_number += 1) {
-        const global: u16 = @intCast(message_number);
-        if (fitz.profile.message_name(global) == null) continue;
-        var field_number: u32 = 0;
-        while (field_number <= std.math.maxInt(u8)) : (field_number += 1) {
-            const profile = fitz.profile.field_profile(global, @intCast(field_number)) orelse
-                continue;
-            try testing.expect(profile.name.len < name_column_width);
-        }
+test "field_name_write: pads to the column, and a longer name still gets a space" {
+    var buffer: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try field_name_write(&writer, "a");
+    try testing.expectEqual(2 + name_column_width, writer.buffered().len);
+
+    // The longest profile name has 38 characters.
+    const longest = "x" ** 38;
+    const shorter = "x" ** (name_column_width - 1);
+    const edges = [_][]const u8{ shorter, "x" ** name_column_width, longest };
+    const widths = [_]usize{ name_column_width, name_column_width + 1, longest.len + 1 };
+    for (edges, widths) |name, width| {
+        writer = std.Io.Writer.fixed(&buffer);
+        try field_name_write(&writer, name);
+        try testing.expectEqual(2 + width, writer.buffered().len);
+        try testing.expect(std.mem.endsWith(u8, writer.buffered(), " "));
     }
 }
 
@@ -1149,4 +1156,32 @@ test "data_message_write: described developer fields decode like standard fields
     try data_message_write(&writer, &data, &descriptions, .readable);
     const block = "record\n  Power                 466 W\n  Avg Distance per Stroke 7\n\n";
     try testing.expectEqualStrings(block, writer.buffered());
+}
+
+test "data_message_write: readable detail names enumerated values, full detail keeps numbers" {
+    const fields = [_]fitz.FieldDefinition{
+        .{ .field_definition_number = 5, .size = 1, .base_type = .@"enum" },
+        .{ .field_definition_number = 6, .size = 1, .base_type = .@"enum" },
+    };
+    const data = fitz.DataMessage{
+        .local_message_type = 0,
+        .global_message_number = 18,
+        .big_endian = false,
+        .compressed_timestamp = null,
+        .fields = &fields,
+        // sport 1 is running; sub_sport 200 has no name.
+        .raw = &.{ 1, 200 },
+        .developer_fields = &.{},
+        .developer_raw = &.{},
+    };
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &data, &no_descriptions, .readable);
+    const block = "session\n  sport                 running\n  sub_sport             200\n\n";
+    try testing.expectEqualStrings(block, writer.buffered());
+
+    writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &data, &no_descriptions, .all);
+    const line = "DATA local=0 global_msg=session sport=1 sub_sport=200\n";
+    try testing.expectEqualStrings(line, writer.buffered());
 }

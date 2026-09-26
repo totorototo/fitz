@@ -37,8 +37,9 @@ record
   heart_rate            107 bpm
 ```
 
-It shows only the fields the built-in profile knows and that hold data,
-with scale and offset applied, then the developer fields the file
+It shows only the fields the profile knows and that hold data, with
+scale and offset applied and enumerated values named (`sport  running`),
+then the developer fields the file
 describes by name (`Heart Rate  82 bpm`, the name as the file writes it),
 and skips a message with nothing to show (the summary still counts it).
 To pull out one kind of message, use awk's paragraph mode:
@@ -138,18 +139,23 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   header's CRC when it is nonzero, and the required 2-byte file CRC
   after the data section, which covers the header and data. The CLI prints each file's
   `header_crc=ok|absent file_crc=ok(0x…)`
-- A small built-in profile (`fitz.profile`): names for well-known global
-  messages, and name, units, scale and offset for the common fields of
-  file_id, file_creator, device_info, event, record, lap, session and
-  activity. `message_name(global)`, `field_profile(global, field)`, and
-  `FieldProfile.scaled(value)` = raw / scale − offset. `FieldProfile.kind`
-  marks dates (UTC or local) and positions, converted with
-  `date_time_unix_s` and `semicircles_degrees`
+- The FIT profile (`fitz.profile`), generated from Garmin's FIT SDK
+  (`fitz.profile.version`, 21.217.0): every message's name, every field's
+  name, units, scale and offset, and the names of enumerated values.
+  `message_name(global)`, `field_profile(global, field)`,
+  `FieldProfile.scaled(value)` = raw / scale − offset, and
+  `FieldProfile.value_name(value)` (`sport` 1 is `running`).
+  `FieldProfile.kind` marks dates (UTC or local) and positions, converted
+  with `date_time_unix_s` and `semicircles_degrees`
 
 ## What it deliberately doesn't do yet
 
-- Only a curated slice of the FIT profile, not the full generated one.
-  Enum values stay numeric (`sport=1`, not `running`)
+- Profile subfields and components aren't applied: a field whose meaning
+  depends on another (event `data`, file_id `product`) keeps its generic
+  name, and a component (record `speed` into `enhanced_speed`, bit-packed
+  `compressed_speed_distance`) isn't expanded. A bit-field type names only
+  single bits, not combinations. `--dump --all` keeps enumerated values
+  as numbers
 - Strict on base types: a non-canonical base type byte (e.g. `0x04`
   instead of `0x84`) or a field size that isn't a multiple of its base
   type size is rejected, where the FIT SDK falls back to a byte array.
@@ -171,8 +177,7 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 
 1. Decide whether to relax the base-type policy to the SDK's byte
    fallback for mis-sized fields (the Coros file above)
-2. Generate the full profile from the FIT SDK (enum value names, and the
-   components and subfields it describes)
+2. Apply the profile's subfields, then its components
 
 ## Layout
 
@@ -182,9 +187,29 @@ src/
   fit.zig    core parser (Parser, FileHeader, DefinitionMessage, DataMessage, Record)
              and base-type decoding (BaseType, FieldIterator, Field, Value), developer
              fields (DeveloperFieldIterator, DeveloperField)
-  profile.zig  curated FIT profile slice: message/field names, units, scale, offset
+  profile.zig  FIT profile lookups: message/field names, units, scale, offset, value names
+  profile_generated.zig  the profile tables, generated from Garmin's FIT SDK; don't edit
   root.zig   library re-exports (`@import("fitz")`)
   main.zig   CLI: header info, per-message-type counts, `--dump` of decoded fields
   fixtures_test.zig  tests against the real files in testdata/
 testdata/    third-party FIT fixtures (python-fitparse, MIT); see testdata/README.md
+tools/profile_generate.py  regenerates src/profile_generated.zig
 ```
+
+## Regenerating the profile
+
+`src/profile_generated.zig` comes from `profile.py` in Garmin's
+[FIT Python SDK](https://github.com/garmin/fit-python-sdk), which Garmin
+generates from the SDK's Profile.xlsx. It is derived from the FIT SDK and
+covered by Garmin's FIT Protocol License, not by fitz's own terms. To move
+to a new profile version:
+
+```sh
+git clone --depth 1 https://github.com/garmin/fit-python-sdk /tmp/fit-python-sdk
+tools/profile_generate.py /tmp/fit-python-sdk > src/profile_generated.zig
+zig fmt src/profile_generated.zig
+zig build test --summary all
+```
+
+Then review the diff: renamed fields or changed units show up in the
+dump.

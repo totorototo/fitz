@@ -159,6 +159,31 @@ test "Activity.fit: a plain SDK example activity" {
     try testing.expectEqual(Counts{ .definition = 10, .data = 22 }, counts);
 }
 
+test "Activity.fit: file_id values have their profile names" {
+    var parser = try fitz.Parser.init(testing.allocator, @embedFile("Activity.fit"));
+    defer parser.deinit();
+    var names_found: u8 = 0;
+    while (try parser.next()) |record| {
+        const data = switch (record) {
+            .definition => continue,
+            .data => |data| data,
+        };
+        if (data.global_message_number != 0) continue; // file_id
+        var iterator = data.fields_iterator();
+        while (iterator.next()) |field| {
+            const profile = fitz.profile.field_profile(0, field.field_definition_number).?;
+            const expected: []const u8 = switch (field.field_definition_number) {
+                0 => "activity", // type 4.
+                1 => "dynastream", // manufacturer 15.
+                else => continue,
+            };
+            try testing.expectEqualStrings(expected, profile.value_name(field.element(0).?).?);
+            names_found += 1;
+        }
+    }
+    try testing.expectEqual(@as(u8, 2), names_found);
+}
+
 test "activity-filecrc.fit and activity-unexpected-eof.fit are rejected before any record" {
     const crc = fitz.Parser.init(testing.allocator, @embedFile("activity-filecrc.fit"));
     try testing.expectError(fitz.FitError.FileCrcMismatch, crc);
