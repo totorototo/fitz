@@ -7,7 +7,9 @@
 //! Scope: file header, record headers (normal + compressed timestamp, with the
 //! timestamp reconstructed), definition messages, and data messages with base-type
 //! value decoding. The header CRC (when present) and the file CRC are verified up
-//! front. Names and scaling live in profile.zig. No developer fields yet.
+//! front. Developer fields are split out of each data message as raw bytes; their base types
+//! live in field_description messages, which this file doesn't interpret. Names and scaling
+//! live in profile.zig.
 //!
 //! Errors are for invalid external bytes; assertions are for invariants
 //! the parser itself guarantees. A failed assertion is a bug in this file.
@@ -34,7 +36,6 @@ pub const FitError = error{
     CompressedTimestampWithTimestampField,
     /// Reconstructing a compressed timestamp would pass the largest u32 timestamp.
     TimestampOverflow,
-    DeveloperFieldsUnsupported,
     OutOfMemory,
 };
 
@@ -47,7 +48,8 @@ const crc_size = 2;
 
 /// Reserved byte, architecture byte, global message number (2), field count.
 const definition_fixed_size = 5;
-/// Field definition number, size, base type.
+/// Field definition number, size, base type. A developer field definition is also 3 bytes:
+/// field number, size, developer data index.
 const field_definition_size = 3;
 const local_message_type_count = 16;
 
@@ -145,8 +147,8 @@ fn file_crc_verify(file: []const u8) FitError!u16 {
 
 pub const NormalRecordHeader = struct {
     is_definition: bool,
-    /// We don't support developer fields yet — read_definition_message
-    /// errors out if this is set.
+    /// Set on a definition message whose standard fields are followed by developer fields.
+    /// Reserved on a data message, whose layout comes from its definition.
     developer_fields: bool,
     local_message_type: u4,
 };
@@ -250,6 +252,30 @@ fn parse_field_definition(bytes: *const [field_definition_size]u8) FitError!Fiel
     return field;
 }
 
+/// A developer field carries no base type: that comes from the field_description message (206)
+/// with the same developer data index and field number, so the size can only be checked against
+/// it once the caller decodes the field (`DeveloperField.field`).
+pub const DeveloperFieldDefinition = struct {
+    field_number: u8,
+    /// Nonzero, checked when the definition is parsed.
+    size: u8,
+    /// Links the field to a developer_data_id message (207) and its field_description messages.
+    developer_data_index: u8,
+};
+
+fn parse_developer_field_definition(
+    bytes: *const [field_definition_size]u8,
+) FitError!DeveloperFieldDefinition {
+    if (bytes[1] == 0) return FitError.InvalidFieldSize;
+    const field = DeveloperFieldDefinition{
+        .field_number = bytes[0],
+        .size = bytes[1],
+        .developer_data_index = bytes[2],
+    };
+    assert(field.size >= 1);
+    return field;
+}
+
 pub const DefinitionMessage = struct {
     local_message_type: u4,
     big_endian: bool,
@@ -257,12 +283,29 @@ pub const DefinitionMessage = struct {
     /// Owned by the Parser's allocator; valid until that local message
     /// type is redefined or the Parser is deinitialized.
     fields: []FieldDefinition,
+    /// Empty unless the record header had the developer-fields bit. Same ownership as `fields`.
+    developer_fields: []DeveloperFieldDefinition,
 
-    pub fn message_size(self: DefinitionMessage) u32 {
+    /// Bytes of a data message: the standard fields, then the developer fields.
+    pub fn message_size(self: *const DefinitionMessage) u32 {
+        const total = self.fields_size() + self.developer_fields_size();
+        assert(total <= 2 * std.math.maxInt(u8) * std.math.maxInt(u8));
+        return total;
+    }
+
+    pub fn fields_size(self: *const DefinitionMessage) u32 {
         assert(self.fields.len <= std.math.maxInt(u8));
         var total: u32 = 0;
         for (self.fields) |field| total += field.size;
-        assert(total <= std.math.maxInt(u8) * std.math.maxInt(u8));
+        assert(total >= self.fields.len);
+        return total;
+    }
+
+    pub fn developer_fields_size(self: *const DefinitionMessage) u32 {
+        assert(self.developer_fields.len <= std.math.maxInt(u8));
+        var total: u32 = 0;
+        for (self.developer_fields) |field| total += field.size;
+        assert(total >= self.developer_fields.len);
         return total;
     }
 };
@@ -277,8 +320,12 @@ pub const DataMessage = struct {
     /// Borrowed from the matching definition, with the same lifetime: valid until that local
     /// message type is redefined or the Parser is deinitialized.
     fields: []const FieldDefinition,
-    /// View into the original input buffer — not owned, not copied.
+    /// The standard fields' bytes. View into the original input buffer — not owned, not copied.
     raw: []const u8,
+    /// Borrowed from the matching definition, like `fields`. Empty for most messages.
+    developer_fields: []const DeveloperFieldDefinition,
+    /// The developer fields' bytes, which follow `raw` in the input buffer.
+    developer_raw: []const u8,
 
     pub fn fields_iterator(self: *const DataMessage) FieldIterator {
         return FieldIterator{
@@ -286,6 +333,69 @@ pub const DataMessage = struct {
             .raw = self.raw,
             .endian = if (self.big_endian) .big else .little,
         };
+    }
+
+    pub fn developer_fields_iterator(self: *const DataMessage) DeveloperFieldIterator {
+        return DeveloperFieldIterator{
+            .fields = self.developer_fields,
+            .raw = self.developer_raw,
+            .endian = if (self.big_endian) .big else .little,
+        };
+    }
+};
+
+/// Walks a data message's developer fields in definition order, like `FieldIterator`.
+pub const DeveloperFieldIterator = struct {
+    fields: []const DeveloperFieldDefinition,
+    raw: []const u8,
+    endian: std.builtin.Endian,
+    index: usize = 0,
+    offset: usize = 0,
+
+    pub fn next(self: *DeveloperFieldIterator) ?DeveloperField {
+        assert(self.index <= self.fields.len);
+        assert(self.offset <= self.raw.len);
+        if (self.index == self.fields.len) {
+            assert(self.offset == self.raw.len);
+            return null;
+        }
+
+        const definition = self.fields[self.index];
+        const field = DeveloperField{
+            .field_number = definition.field_number,
+            .developer_data_index = definition.developer_data_index,
+            .endian = self.endian,
+            .raw = self.raw[self.offset..][0..definition.size],
+        };
+        self.index += 1;
+        self.offset += definition.size;
+        return field;
+    }
+};
+
+/// One developer field of a data message, as bytes. Its base type, name, units and scale are in
+/// the field_description message (206) with the same developer data index and field number.
+pub const DeveloperField = struct {
+    field_number: u8,
+    developer_data_index: u8,
+    endian: std.builtin.Endian,
+    raw: []const u8,
+
+    /// Views the bytes as `base_type`, the type the field's description gives, so they decode
+    /// like a standard field. The size is checked here because this is the first point where
+    /// the base type is known; the file, not fitz, is wrong when it doesn't fit.
+    pub fn field(self: *const DeveloperField, base_type: BaseType) FitError!Field {
+        assert(self.raw.len >= 1);
+        assert(self.raw.len <= std.math.maxInt(u8));
+        if (self.raw.len % base_type.size() != 0) return FitError.InvalidFieldSize;
+        const result = Field{
+            .field_definition_number = self.field_number,
+            .base_type = base_type,
+            .endian = self.endian,
+            .raw = self.raw,
+        };
+        assert(result.element_count() >= 1);
+        return result;
     }
 };
 
@@ -523,9 +633,14 @@ pub const Parser = struct {
 
     pub fn deinit(self: *Parser) void {
         for (&self.definitions) |*definition_slot| {
-            if (definition_slot.*) |definition| self.allocator.free(definition.fields);
+            if (definition_slot.*) |definition| self.definition_free(&definition);
             definition_slot.* = null;
         }
+    }
+
+    fn definition_free(self: *Parser, definition: *const DefinitionMessage) void {
+        self.allocator.free(definition.fields);
+        self.allocator.free(definition.developer_fields);
     }
 
     /// Returns the next record, or null once the data section (as sized
@@ -572,7 +687,6 @@ pub const Parser = struct {
 
     fn read_definition_message(self: *Parser, record_header: NormalRecordHeader) FitError!Record {
         assert(record_header.is_definition);
-        if (record_header.developer_fields) return FitError.DeveloperFieldsUnsupported;
         if (self.remaining() < definition_fixed_size) return FitError.UnexpectedEof;
 
         // fixed[0] is a reserved byte, ignored.
@@ -586,29 +700,65 @@ pub const Parser = struct {
         const field_count = fixed[4];
         self.position += definition_fixed_size;
 
-        const fields_size = @as(usize, field_count) * field_definition_size;
-        if (self.remaining() < fields_size) return FitError.UnexpectedEof;
-
-        const fields = try self.allocator.alloc(FieldDefinition, field_count);
+        const fields = try self.read_field_definitions(
+            FieldDefinition,
+            field_count,
+            parse_field_definition,
+        );
         errdefer self.allocator.free(fields);
-        for (fields, 0..) |*field, index| {
-            const offset = self.position + index * field_definition_size;
-            field.* = try parse_field_definition(self.buffer[offset..][0..field_definition_size]);
+
+        // Without the header bit there is no count byte, which is the same as a count of 0.
+        var developer_field_count: u8 = 0;
+        if (record_header.developer_fields) {
+            if (self.remaining() < 1) return FitError.UnexpectedEof;
+            developer_field_count = self.buffer[self.position];
+            self.position += 1;
         }
-        self.position += fields_size;
+        const developer_fields = try self.read_field_definitions(
+            DeveloperFieldDefinition,
+            developer_field_count,
+            parse_developer_field_definition,
+        );
+        errdefer self.allocator.free(developer_fields);
 
         const definition = DefinitionMessage{
             .local_message_type = record_header.local_message_type,
             .big_endian = endian == .big,
             .global_message_number = global_message_number,
             .fields = fields,
+            .developer_fields = developer_fields,
         };
         const slot = &self.definitions[record_header.local_message_type];
-        if (slot.*) |previous| self.allocator.free(previous.fields);
+        if (slot.*) |*previous| self.definition_free(previous);
         slot.* = definition;
 
         assert(definition.fields.len == field_count);
+        assert(definition.developer_fields.len == developer_field_count);
         return Record{ .definition = definition };
+    }
+
+    /// Reads `count` 3-byte definitions of either kind into a slice the caller owns. Nothing is
+    /// allocated when the bytes are missing, and nothing leaks when one of them is invalid.
+    fn read_field_definitions(
+        self: *Parser,
+        comptime Definition: type,
+        count: u8,
+        comptime parse: fn (*const [field_definition_size]u8) FitError!Definition,
+    ) FitError![]Definition {
+        const size = @as(usize, count) * field_definition_size;
+        if (self.remaining() < size) return FitError.UnexpectedEof;
+
+        const definitions = try self.allocator.alloc(Definition, count);
+        errdefer self.allocator.free(definitions);
+        for (definitions, 0..) |*definition, index| {
+            const offset = self.position + index * field_definition_size;
+            definition.* = try parse(self.buffer[offset..][0..field_definition_size]);
+        }
+        self.position += size;
+
+        assert(definitions.len == count);
+        assert(self.position <= self.end);
+        return definitions;
     }
 
     /// `time_offset` is set for a compressed-timestamp header and null for a normal one.
@@ -620,7 +770,9 @@ pub const Parser = struct {
         const size = definition.message_size();
         if (self.remaining() < size) return FitError.UnexpectedEof;
 
-        const raw = self.buffer[self.position..][0..size];
+        const raw = self.buffer[self.position..][0..definition.fields_size()];
+        const developer_raw = self.buffer[self.position + raw.len ..][0..definition
+            .developer_fields_size()];
         const endian: std.builtin.Endian = if (definition.big_endian) .big else .little;
         var compressed_timestamp: ?u32 = null;
         if (time_offset) |offset| {
@@ -636,7 +788,8 @@ pub const Parser = struct {
         }
         self.position += size;
 
-        assert(raw.len == size);
+        assert(raw.len + developer_raw.len == size);
+        assert(raw.ptr + raw.len == developer_raw.ptr);
         assert((compressed_timestamp != null) == (time_offset != null));
         return Record{ .data = DataMessage{
             .local_message_type = local_message_type,
@@ -645,6 +798,8 @@ pub const Parser = struct {
             .compressed_timestamp = compressed_timestamp,
             .fields = definition.fields,
             .raw = raw,
+            .developer_fields = definition.developer_fields,
+            .developer_raw = developer_raw,
         } };
     }
 };
@@ -781,10 +936,31 @@ test "DefinitionMessage.message_size" {
         .big_endian = false,
         .global_message_number = 0,
         .fields = &fields,
+        .developer_fields = &.{},
     };
     try testing.expectEqual(@as(u32, 260), definition.message_size());
+    try testing.expectEqual(@as(u32, 260), definition.fields_size());
+    try testing.expectEqual(@as(u32, 0), definition.developer_fields_size());
+
+    // The largest message: 255 standard and 255 developer fields of 255 bytes each.
+    var fields_max = [_]FieldDefinition{.{
+        .field_definition_number = 0,
+        .size = 255,
+        .base_type = .byte,
+    }} ** 255;
+    var developer_fields_max = [_]DeveloperFieldDefinition{.{
+        .field_number = 0,
+        .size = 255,
+        .developer_data_index = 0,
+    }} ** 255;
+    definition.fields = &fields_max;
+    definition.developer_fields = &developer_fields_max;
+    try testing.expectEqual(@as(u32, 2 * 255 * 255), definition.message_size());
 
     definition.fields = fields[0..0];
+    definition.developer_fields = developer_fields_max[0..1];
+    try testing.expectEqual(@as(u32, 255), definition.message_size());
+    definition.developer_fields = developer_fields_max[0..0];
     try testing.expectEqual(@as(u32, 0), definition.message_size());
 }
 
@@ -1062,7 +1238,6 @@ test "Parser: rejects malformed records" {
     const cases = [_]struct { data: []const u8, expected: FitError }{
         .{ .data = &.{0x00}, .expected = FitError.UnknownLocalMessageType },
         .{ .data = &.{0x80}, .expected = FitError.UnknownLocalMessageType },
-        .{ .data = &.{ 0x60, 0, 0, 0, 0, 0 }, .expected = FitError.DeveloperFieldsUnsupported },
         .{ .data = &.{ 0x40, 0, 2, 0, 0, 0 }, .expected = FitError.InvalidArchitecture },
         .{ .data = &.{ 0x40, 0, 0, 0 }, .expected = FitError.UnexpectedEof },
         .{ .data = &.{ 0x40, 0, 0, 0, 0, 1, 0, 1 }, .expected = FitError.UnexpectedEof },
@@ -1312,4 +1487,178 @@ test "Parser: rejects invalid field definitions without leaking" {
         defer parser.deinit();
         try testing.expectError(case.expected, parser.next());
     }
+}
+
+/// Definition: local type 3, little endian, global message 20, one uint8 standard field
+/// (heart rate), then two developer fields: index 0 field 1 (2 bytes) and index 1 field 253
+/// (4 bytes). The second is numbered like a timestamp, but developer numbers are their own space.
+const test_definition_local_3_developer = [_]u8{
+    0x63, 0, 0, 20, 0, 1, 3, 1, 0x02, // Header, fixed part, heart rate.
+    2, 1, 2, 0, 253, 4, 1, // Developer field count, then the two developer fields.
+};
+
+test "Parser: developer fields follow the standard fields" {
+    const file = try test_file_build(testing.allocator, &test_definition_local_3_developer ++
+        [_]u8{ 0x03, 150, 0x34, 0x12, 0xFF, 0xFF, 0xFF, 0xFF });
+    defer testing.allocator.free(file);
+
+    var parser = try Parser.init(testing.allocator, file);
+    defer parser.deinit();
+    const definition = (try parser.next()).?.definition;
+    try testing.expectEqual(@as(usize, 1), definition.fields.len);
+    try testing.expectEqual(@as(usize, 2), definition.developer_fields.len);
+    try testing.expectEqual(@as(u32, 7), definition.message_size());
+    const second = definition.developer_fields[1];
+    try testing.expectEqual(@as(u8, 253), second.field_number);
+    try testing.expectEqual(@as(u8, 4), second.size);
+    try testing.expectEqual(@as(u8, 1), second.developer_data_index);
+
+    const data = (try parser.next()).?.data;
+    try testing.expectEqualSlices(u8, &.{150}, data.raw);
+    try testing.expectEqualSlices(u8, &.{ 0x34, 0x12, 0xFF, 0xFF, 0xFF, 0xFF }, data.developer_raw);
+    var standard = data.fields_iterator();
+    try testing.expectEqual(Value{ .unsigned = 150 }, standard.next().?.element(0).?);
+    try testing.expectEqual(@as(?Field, null), standard.next());
+
+    var iterator = data.developer_fields_iterator();
+    const counter = iterator.next().?;
+    try testing.expectEqual(@as(u8, 0), counter.developer_data_index);
+    try testing.expectEqual(@as(u8, 1), counter.field_number);
+    const counter_field = try counter.field(.uint16);
+    try testing.expectEqual(Value{ .unsigned = 0x1234 }, counter_field.element(0).?);
+    // Developer field 253 isn't the timestamp: it is raw bytes whose type only 206 knows.
+    const other = iterator.next().?;
+    try testing.expectEqual(@as(?Value, null), (try other.field(.uint32)).element(0));
+    try testing.expectEqual(@as(?DeveloperField, null), iterator.next());
+    try testing.expectEqual(@as(?DeveloperField, null), iterator.next());
+    try testing.expectEqual(@as(?Record, null), try parser.next());
+}
+
+test "Parser: developer fields are big endian with their message, and count 0 is valid" {
+    // Local type 1, big endian, global 20, no standard fields, one 2-byte developer field.
+    const big_endian = [_]u8{ 0x61, 0, 1, 0, 20, 0, 1, 7, 2, 0 };
+    // Local type 2 with the developer-fields bit set, but no fields of either kind.
+    const empty = [_]u8{ 0x62, 0, 0, 20, 0, 0, 0 };
+    const file = try test_file_build(
+        testing.allocator,
+        &big_endian ++ [_]u8{ 0x01, 0x12, 0x34 } ++ empty ++ [_]u8{0x02},
+    );
+    defer testing.allocator.free(file);
+
+    var parser = try Parser.init(testing.allocator, file);
+    defer parser.deinit();
+    _ = (try parser.next()).?.definition;
+    const data = (try parser.next()).?.data;
+    try testing.expectEqual(@as(usize, 0), data.raw.len);
+    var iterator = data.developer_fields_iterator();
+    const field = try iterator.next().?.field(.uint16);
+    try testing.expectEqual(Value{ .unsigned = 0x1234 }, field.element(0).?);
+
+    const empty_definition = (try parser.next()).?.definition;
+    try testing.expectEqual(@as(usize, 0), empty_definition.developer_fields.len);
+    const empty_data = (try parser.next()).?.data;
+    try testing.expectEqual(@as(usize, 0), empty_data.developer_raw.len);
+    iterator = empty_data.developer_fields_iterator();
+    try testing.expectEqual(@as(?DeveloperField, null), iterator.next());
+}
+
+test "Parser: a compressed-timestamp message can carry developer fields" {
+    const file = try test_file_build(testing.allocator, &test_definition_local_0 ++
+        test_definition_local_3_developer ++ [_]u8{
+        0x00, 0x10, 0x00, 0x00, 0x00, // Timestamp 16.
+        0b1_11_10010, 150, 1, 0, 2, 0, 0, 0, // Local type 3, offset 18: timestamp 18.
+    });
+    defer testing.allocator.free(file);
+
+    var parser = try Parser.init(testing.allocator, file);
+    defer parser.deinit();
+    _ = (try parser.next()).?.definition;
+    _ = (try parser.next()).?.definition;
+    _ = (try parser.next()).?.data;
+    const data = (try parser.next()).?.data;
+    try testing.expectEqual(@as(?u32, 18), data.compressed_timestamp);
+    try testing.expectEqual(@as(usize, 6), data.developer_raw.len);
+}
+
+test "Parser: redefining a type with developer fields frees them" {
+    const file = try test_file_build(testing.allocator, &test_definition_local_3_developer ++
+        test_definition_local_3_developer ++ [_]u8{ 0x43, 0, 0, 20, 0, 0 });
+    defer testing.allocator.free(file);
+
+    var parser = try Parser.init(testing.allocator, file);
+    defer parser.deinit();
+    _ = (try parser.next()).?.definition;
+    _ = (try parser.next()).?.definition;
+    const last = (try parser.next()).?.definition;
+    try testing.expectEqual(@as(usize, 0), last.developer_fields.len);
+    // The testing allocator fails the test if either replaced definition leaked.
+}
+
+test "Parser: rejects malformed developer field definitions without leaking" {
+    const cases = [_]struct { data: []const u8, expected: FitError }{
+        // The count byte is missing after one standard field.
+        .{ .data = &.{ 0x60, 0, 0, 0, 0, 1, 0, 1, 0x02 }, .expected = FitError.UnexpectedEof },
+        // Two developer fields announced, one present.
+        .{ .data = &.{ 0x60, 0, 0, 0, 0, 0, 2, 0, 1, 0 }, .expected = FitError.UnexpectedEof },
+        // A zero-size developer field, after a valid standard field and a valid developer one.
+        .{
+            .data = &.{ 0x60, 0, 0, 0, 0, 1, 0, 1, 0x02, 2, 0, 1, 0, 1, 0, 0 },
+            .expected = FitError.InvalidFieldSize,
+        },
+        // The data message is one byte short of its developer fields.
+        .{
+            .data = &test_definition_local_3_developer ++ [_]u8{ 0x03, 150, 1, 2, 3, 4, 5 },
+            .expected = FitError.UnexpectedEof,
+        },
+    };
+    for (cases) |case| {
+        const file = try test_file_build(testing.allocator, case.data);
+        defer testing.allocator.free(file);
+
+        var parser = try Parser.init(testing.allocator, file);
+        defer parser.deinit();
+        while (true) {
+            const record = parser.next() catch |err| {
+                try testing.expectEqual(case.expected, err);
+                break;
+            };
+            try testing.expect(record != null);
+        }
+    }
+}
+
+test "parse_developer_field_definition: size must be nonzero" {
+    const field = try parse_developer_field_definition(&.{ 9, 255, 3 });
+    try testing.expectEqual(@as(u8, 9), field.field_number);
+    try testing.expectEqual(@as(u8, 255), field.size);
+    try testing.expectEqual(@as(u8, 3), field.developer_data_index);
+    _ = try parse_developer_field_definition(&.{ 0, 1, 0 });
+    _ = try parse_developer_field_definition(&.{ 255, 1, 255 });
+    const zero = parse_developer_field_definition(&.{ 0, 0, 0 });
+    try testing.expectError(FitError.InvalidFieldSize, zero);
+}
+
+test "DeveloperField.field: the size must fit the described base type" {
+    const bytes_max = [_]u8{0x41} ** 255;
+    var developer = DeveloperField{
+        .field_number = 0,
+        .developer_data_index = 0,
+        .endian = .little,
+        .raw = &.{ 1, 0, 2, 0 },
+    };
+    const pair = try developer.field(.uint16);
+    try testing.expectEqual(@as(u8, 2), pair.element_count());
+    try testing.expectEqual(Value{ .unsigned = 2 }, pair.element(1).?);
+    try testing.expectEqual(@as(u8, 1), (try developer.field(.uint32)).element_count());
+    try testing.expectError(FitError.InvalidFieldSize, developer.field(.float64));
+
+    developer.raw = bytes_max[0..3];
+    try testing.expectError(FitError.InvalidFieldSize, developer.field(.uint16));
+    try testing.expectEqual(@as(u8, 3), (try developer.field(.uint8)).element_count());
+    developer.raw = &bytes_max;
+    const text = try developer.field(.string);
+    try testing.expectEqual(@as(usize, 255), text.element(0).?.string.len);
+    try testing.expectEqual(@as(u8, 1), (try developer.field(.byte)).element_count());
+    developer.raw = bytes_max[0..1];
+    try testing.expectError(FitError.InvalidFieldSize, developer.field(.sint16));
 }

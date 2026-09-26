@@ -43,7 +43,9 @@ stays in seconds. Positions are in degrees.
 It shows every field as stored, for debugging: `-` for a
 base type's invalid ("no data") sentinel, unknown messages and fields by
 number, and dates and positions in raw seconds and semicircles. Scale and
-offset still apply. In both modes, arrays are in brackets, strings quoted
+offset still apply. Developer fields come last, as their stored bytes:
+`dev:0:3=0x5fba8940` is developer data index 0, field 3. The readable
+dump leaves them out. In both modes, arrays are in brackets, strings quoted
 and byte fields hex. A message with a compressed-timestamp header gets
 its rebuilt timestamp printed first, and the summary counts how many
 there were.
@@ -91,7 +93,14 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   or the last rebuilt one) and applies each header's 5-bit offset to it,
   moving to the next 32-second window when the offset wraps
 - Parses definition messages (local message type table, endianness,
-  global message number, field definitions)
+  global message number, field definitions, developer field definitions)
+- Splits developer fields out of each data message
+  (`DataMessage.developer_fields_iterator()` → `DeveloperField`: developer
+  data index, field number and raw bytes). Their base type lives in a
+  field_description message (206), which fitz doesn't interpret yet; a
+  caller that has it calls `DeveloperField.field(base_type)` to get a
+  `Field` that decodes like any other, with the size checked against the
+  base type there
 - Parses data messages per the matching definition, and decodes each
   field's base type (`DataMessage.fields_iterator()` → `Field.element(i)`
   → `Value`: unsigned, signed, float, string or bytes). Numeric fields
@@ -121,8 +130,9 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 - Strict on compressed timestamps: a compressed header before any full
   timestamp, one whose definition also has field 253, or one that would
   overflow `u32` is an error, where the FIT SDK assumes a reference of 0
-- No developer field support (returns `DeveloperFieldsUnsupported` if
-  encountered)
+- Developer fields stay raw bytes: field_description (206) and
+  developer_data_id (207) messages are parsed like any other message, but
+  not used to name, type or scale developer fields
 - Strict on CRCs, with no opt-out: a mismatched header or file CRC, or a
   missing file CRC, rejects the whole file, so a damaged file can't be
   partially read
@@ -130,7 +140,8 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 
 ## Rough next steps
 
-1. Developer field definitions
+1. Decode developer fields through their field_description messages
+   (name, base type, units, scale, offset)
 
 ## Layout
 
@@ -138,7 +149,8 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 build.zig / build.zig.zon
 src/
   fit.zig    core parser (Parser, FileHeader, DefinitionMessage, DataMessage, Record)
-             and base-type decoding (BaseType, FieldIterator, Field, Value)
+             and base-type decoding (BaseType, FieldIterator, Field, Value), developer
+             fields (DeveloperFieldIterator, DeveloperField)
   profile.zig  curated FIT profile slice: message/field names, units, scale, offset
   root.zig   library re-exports (`@import("fitz")`)
   main.zig   CLI: header info, per-message-type counts, `--dump` of decoded fields
