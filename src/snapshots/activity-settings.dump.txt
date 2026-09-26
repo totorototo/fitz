@@ -4,7 +4,7 @@ file_id
   serial_number         2147483647
   time_created          2012-04-09T21:22:26Z
   manufacturer          dynastream
-  product               1
+  garmin_product        hrm1
   type                  activity
 
 file_creator
@@ -12,7 +12,7 @@ file_creator
 
 event
   timestamp             2012-04-09T21:22:26Z
-  data                  0
+  timer_trigger         manual
   event                 timer
   event_type            start
   event_group           0
@@ -131,7 +131,7 @@ record
 
 event
   timestamp             2012-04-09T21:22:39Z
-  data                  0
+  timer_trigger         manual
   event                 timer
   event_type            stop_all
   event_group           0
@@ -201,7 +201,7 @@ file 2 of 2
 
 file_id
   manufacturer          garmin
-  product               988
+  garmin_product        fr60
   serial_number         123456
   type                  settings
 

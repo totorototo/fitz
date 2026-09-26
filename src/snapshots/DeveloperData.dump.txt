@@ -1,7 +1,7 @@
 file_id
   manufacturer          dynastream
   type                  activity
-  product               9001
+  garmin_product        9001
   serial_number         1701
 
 developer_data_id

@@ -151,13 +151,19 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   `FieldProfile.value_name(value)` (`sport` 1 is `running`).
   `FieldProfile.kind` marks dates (UTC or local) and positions, converted
   with `date_time_unix_s` and `semicircles_degrees`
+- Profile subfields: `data_field_profile(data, field)` gives a field the
+  meaning another field of its message selects (event `data` is
+  `timer_trigger` in a timer event, file_id `product` is `garmin_product`
+  for a Garmin device), with that subfield's name, units, scale and value
+  names. When several match, the first in profile order applies, as in
+  Garmin's decoders. Both `--dump` modes use it; `field_profile` keeps the
+  field's own profile
 
 ## What it deliberately doesn't do yet
 
-- Profile subfields and components aren't applied: a field whose meaning
-  depends on another (event `data`, file_id `product`) keeps its generic
-  name, and a component (record `speed` into `enhanced_speed`, bit-packed
-  `compressed_speed_distance`) isn't expanded. A bit-field type names only
+- Profile components aren't applied: a component (record `speed` into
+  `enhanced_speed`, bit-packed `compressed_speed_distance`, or a subfield's
+  own components such as event `gear_change_data`) isn't expanded. A bit-field type names only
   single bits, not combinations, except the masked types (message_index,
   left_right_balance), whose values split into flags and a number.
   `--dump --all` keeps these values as stored numbers
@@ -182,7 +188,7 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 
 1. Decide whether to relax the base-type policy to the SDK's byte
    fallback for mis-sized fields (the Coros file above)
-2. Apply the profile's subfields, then its components
+2. Apply the profile's components
 
 ## Layout
 
@@ -192,7 +198,8 @@ src/
   fit.zig    core parser (Parser, FileHeader, DefinitionMessage, DataMessage, Record)
              and base-type decoding (BaseType, FieldIterator, Field, Value), developer
              fields (DeveloperFieldIterator, DeveloperField)
-  profile.zig  FIT profile lookups: message/field names, units, scale, offset, value names
+  profile.zig  FIT profile lookups: message/field names, units, scale, offset, value names,
+               subfields
   profile_generated.zig  the profile tables, generated from Garmin's FIT SDK; don't edit
   root.zig   library re-exports (`@import("fitz")`)
   main.zig   CLI: header info, per-message-type counts, `--dump` of decoded fields

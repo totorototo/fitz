@@ -31,12 +31,13 @@ at a time, not all at once.
   verification, normal and compressed-timestamp record headers (compressed timestamps are rebuilt against
   the latest field 253), definition messages, and data messages with base-type value decoding
   (`Field.element` returns a typed `Value`, or null for the base type's invalid sentinel).
-  Messages, fields and enumerated values are named, scaled and given units by `profile.zig`.
+  Messages, fields and enumerated values are named, scaled and given units by `profile.zig`,
+  and `profile.data_field_profile` applies the subfield a message selects (first match wins).
   Developer field definitions are parsed and each data message's developer fields are split out
   as raw bytes. Each file's field_description (206) messages are collected in
   `Parser.developer_field_descriptions` (base type, name, units, scale, offset), and
   `DeveloperField.field(base_type)` decodes a field once its description is known.
-- **Not yet supported**: profile subfields and components, and a field_description's array,
+- **Not yet supported**: profile components, and a field_description's array,
   components and native-field entries.
 - **Error policy**: `FitError` is for invalid external bytes. An `assert` is for parser invariants,
   so a failed assert means a bug in fitz, never a bad file.

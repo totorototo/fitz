@@ -1,4 +1,4 @@
-DATA local=0 global_msg=file_id manufacturer=15 type=4 product=9001 serial_number=1701
+DATA local=0 global_msg=file_id manufacturer=15 type=4 garmin_product=9001 serial_number=1701
 DATA local=0 global_msg=developer_data_id application_id=0x0101020305080d1522375990e97962db developer_data_index=0
 DATA local=0 global_msg=field_description developer_data_index=0 field_definition_number=0 fit_base_type_id=1 field_name="doughnuts_earned" units="doughnuts"
 DATA local=0 global_msg=record heart_rate=140bpm cadence=88rpm distance=510m speed=47.488m/s dev:0:0=1doughnuts

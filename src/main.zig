@@ -347,10 +347,9 @@ fn data_message_block_write(
     iterator = data.fields_iterator();
     while (iterator.next()) |field| {
         if (!field_is_readable(&field, data.global_message_number)) continue;
-        const profile = fitz.profile.field_profile(
-            data.global_message_number,
-            field.field_definition_number,
-        ).?;
+        // A subfield exists only under a field the profile knows, so a readable field always
+        // has a profile, and the message may give it a subfield's name, units and scale.
+        const profile = fitz.profile.data_field_profile(data, field.field_definition_number).?;
         try field_name_write(writer, profile.name);
         try field_value_write(writer, &field, &profile, .readable);
         try writer.writeByte('\n');
@@ -467,10 +466,7 @@ fn data_message_line_write(
     var iterator = data.fields_iterator();
     // Bounded by the definition's field count, at most 255.
     while (iterator.next()) |field| {
-        const field_profile = fitz.profile.field_profile(
-            data.global_message_number,
-            field.field_definition_number,
-        );
+        const field_profile = fitz.profile.data_field_profile(data, field.field_definition_number);
         try writer.writeByte(' ');
         if (field_profile) |profile| {
             try writer.writeAll(profile.name);
