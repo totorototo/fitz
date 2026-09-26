@@ -13,22 +13,30 @@ zig build            # builds lib + cli into zig-out/
 zig build test       # runs unit tests
 zig build run -- path/to/file.fit
 zig build run -- --dump path/to/file.fit > dump.txt
+zig build run -- --dump --all path/to/file.fit > dump-all.txt
 ```
 
 Without flags the CLI prints the header and a per-message-type count
 summary to stderr. `--dump` also writes one line per data message to
-stdout, e.g.
+stdout, meant for reading:
 
 ```
-DATA local=3 global_msg=record timestamp=1147594034s enhanced_altitude=1241.8m heart_rate=146bpm vertical_oscillation=- 140=0
+DATA local=2 global_msg=record timestamp=2026-09-24T10:12:54Z position_lat=45.026082° position_long=-0.808959° enhanced_altitude=24.2m heart_rate=107bpm
 ```
 
-A message with a compressed-timestamp header gets its rebuilt
-`timestamp=…s` printed first, and the summary counts how many there were.
-Fields the built-in profile knows print as `name=value` plus units, with
-scale and offset applied. Unknown messages and fields keep their numbers
-and raw values. Arrays are in brackets, strings quoted, byte fields hex,
-and `-` marks a base type's invalid ("no data") sentinel.
+It shows only the fields the built-in profile knows and that hold data,
+as `name=value` plus units, with scale and offset applied. Dates are
+ISO 8601: UTC with a `Z`, local time (`local_timestamp`) without one, and
+a date_time below `0x10000000` (seconds since the device powered on)
+stays in seconds. Positions are in degrees.
+
+`--dump --all` prints every field as stored, for debugging: `-` for a
+base type's invalid ("no data") sentinel, unknown messages and fields by
+number, and dates and positions in raw seconds and semicircles. Scale and
+offset still apply. In both modes, arrays are in brackets, strings quoted
+and byte fields hex. A message with a compressed-timestamp header gets
+its rebuilt timestamp printed first, and the summary counts how many
+there were.
 
 Targets Zig 0.16.0 (explicit `std.Io`, `std.process.Init` main,
 unmanaged containers). Only `main.zig` does I/O; `fit.zig` parses an
@@ -89,14 +97,14 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   messages, and name, units, scale and offset for the common fields of
   file_id, file_creator, device_info, event, record, lap, session and
   activity. `message_name(global)`, `field_profile(global, field)`, and
-  `FieldProfile.scaled(value)` = raw / scale − offset
+  `FieldProfile.scaled(value)` = raw / scale − offset. `FieldProfile.kind`
+  marks dates (UTC or local) and positions, converted with
+  `date_time_unix_s` and `semicircles_degrees`
 
 ## What it deliberately doesn't do yet
 
 - Only a curated slice of the FIT profile, not the full generated one.
-  Enum values stay numeric (`sport=1`, not `running`), timestamps stay
-  seconds since the FIT epoch (1989-12-31 UTC), and positions stay in
-  semicircles rather than degrees
+  Enum values stay numeric (`sport=1`, not `running`)
 - Strict on base types: a non-canonical base type byte (e.g. `0x04`
   instead of `0x84`) or a field size that isn't a multiple of its base
   type size is rejected, where the FIT SDK falls back to a byte array

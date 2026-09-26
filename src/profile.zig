@@ -3,15 +3,52 @@
 //! activity file is built from. It is not the full generated profile, which has thousands of
 //! fields and belongs in a code generator. Pure lookups, no allocation.
 //!
-//! FIT scaling: physical value = raw / scale - offset.
+//! FIT scaling: physical value = raw / scale - offset. Dates and positions are not scaled but
+//! converted, and `FieldProfile.kind` says which conversion applies.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const fit = @import("fit.zig");
 
+/// Seconds from the Unix epoch to the FIT epoch, 1989-12-31 00:00:00 UTC.
+pub const fit_epoch_unix_s: u64 = 631065600;
+/// A FIT date_time below this counts seconds since the device powered on, not since the FIT
+/// epoch, so it is not a calendar date.
+pub const date_time_absolute_min: u32 = 0x10000000;
+/// 2^31 semicircles make 180 degrees.
+const semicircles_per_180_degrees: f64 = 2147483648.0;
+
+pub const Kind = enum {
+    /// A plain number, scaled when the entry has a scale or offset.
+    number,
+    /// uint32 seconds since the FIT epoch, in UTC. Units are "s".
+    date_time,
+    /// The same encoding in the device's local time zone. Units are "s".
+    local_date_time,
+    /// sint32 angle. Units are "semicircles".
+    semicircles,
+};
+
+/// Converts a FIT date_time to Unix seconds. Returns null for a value below
+/// `date_time_absolute_min`, which is time since power-on and has no calendar date.
+pub fn date_time_unix_s(date_time: u32) ?u64 {
+    if (date_time < date_time_absolute_min) return null;
+    const unix_s = fit_epoch_unix_s + date_time;
+    assert(unix_s > fit_epoch_unix_s);
+    return unix_s;
+}
+
+pub fn semicircles_degrees(semicircles: f64) f64 {
+    const degrees = semicircles * 180.0 / semicircles_per_180_degrees;
+    // A sint32 can't hold more than half a turn either way.
+    assert(@abs(degrees) <= 180.0 or @abs(semicircles) > semicircles_per_180_degrees);
+    return degrees;
+}
+
 pub const FieldProfile = struct {
     /// snake_case, as in the FIT profile.
     name: []const u8,
+    kind: Kind = .number,
     /// Empty when the field is dimensionless (an enum, an index, a count).
     units: []const u8 = "",
     scale: u16 = 1,
@@ -35,7 +72,10 @@ pub const FieldProfile = struct {
         };
         const scale: f64 = @floatFromInt(self.scale);
         const offset: f64 = @floatFromInt(self.offset);
-        return raw / scale - offset;
+        // (raw - offset * scale) / scale rather than raw / scale - offset: for integer raw
+        // values the subtraction is exact, so the one division is the only rounding, and the
+        // result prints as its shortest decimal (24.2, not 24.200000000000045).
+        return (raw - offset * scale) / scale;
     }
 };
 
@@ -85,7 +125,7 @@ fn file_id(field_definition_number: u8) ?FieldProfile {
         1 => .{ .name = "manufacturer" },
         2 => .{ .name = "product" },
         3 => .{ .name = "serial_number" },
-        4 => .{ .name = "time_created", .units = "s" },
+        4 => .{ .name = "time_created", .kind = .date_time, .units = "s" },
         5 => .{ .name = "number" },
         8 => .{ .name = "product_name" },
         else => null,
@@ -102,7 +142,7 @@ fn file_creator(field_definition_number: u8) ?FieldProfile {
 
 fn device_info(field_definition_number: u8) ?FieldProfile {
     return switch (field_definition_number) {
-        253 => .{ .name = "timestamp", .units = "s" },
+        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
         0 => .{ .name = "device_index" },
         1 => .{ .name = "device_type" },
         2 => .{ .name = "manufacturer" },
@@ -121,7 +161,7 @@ fn device_info(field_definition_number: u8) ?FieldProfile {
 
 fn event(field_definition_number: u8) ?FieldProfile {
     return switch (field_definition_number) {
-        253 => .{ .name = "timestamp", .units = "s" },
+        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
         0 => .{ .name = "event" },
         1 => .{ .name = "event_type" },
         2 => .{ .name = "data16" },
@@ -133,9 +173,9 @@ fn event(field_definition_number: u8) ?FieldProfile {
 
 fn record(field_definition_number: u8) ?FieldProfile {
     return switch (field_definition_number) {
-        253 => .{ .name = "timestamp", .units = "s" },
-        0 => .{ .name = "position_lat", .units = "semicircles" },
-        1 => .{ .name = "position_long", .units = "semicircles" },
+        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
+        0 => .{ .name = "position_lat", .kind = .semicircles, .units = "semicircles" },
+        1 => .{ .name = "position_long", .kind = .semicircles, .units = "semicircles" },
         2 => .{ .name = "altitude", .units = "m", .scale = 5, .offset = 500 },
         3 => .{ .name = "heart_rate", .units = "bpm" },
         4 => .{ .name = "cadence", .units = "rpm" },
@@ -161,14 +201,14 @@ fn record(field_definition_number: u8) ?FieldProfile {
 fn lap(field_definition_number: u8) ?FieldProfile {
     return switch (field_definition_number) {
         254 => .{ .name = "message_index" },
-        253 => .{ .name = "timestamp", .units = "s" },
+        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
         0 => .{ .name = "event" },
         1 => .{ .name = "event_type" },
-        2 => .{ .name = "start_time", .units = "s" },
-        3 => .{ .name = "start_position_lat", .units = "semicircles" },
-        4 => .{ .name = "start_position_long", .units = "semicircles" },
-        5 => .{ .name = "end_position_lat", .units = "semicircles" },
-        6 => .{ .name = "end_position_long", .units = "semicircles" },
+        2 => .{ .name = "start_time", .kind = .date_time, .units = "s" },
+        3 => .{ .name = "start_position_lat", .kind = .semicircles, .units = "semicircles" },
+        4 => .{ .name = "start_position_long", .kind = .semicircles, .units = "semicircles" },
+        5 => .{ .name = "end_position_lat", .kind = .semicircles, .units = "semicircles" },
+        6 => .{ .name = "end_position_long", .kind = .semicircles, .units = "semicircles" },
         7 => .{ .name = "total_elapsed_time", .units = "s", .scale = 1000 },
         8 => .{ .name = "total_timer_time", .units = "s", .scale = 1000 },
         9 => .{ .name = "total_distance", .units = "m", .scale = 100 },
@@ -185,10 +225,10 @@ fn lap(field_definition_number: u8) ?FieldProfile {
         21 => .{ .name = "total_ascent", .units = "m" },
         22 => .{ .name = "total_descent", .units = "m" },
         24 => .{ .name = "lap_trigger" },
-        27 => .{ .name = "nec_lat", .units = "semicircles" },
-        28 => .{ .name = "nec_long", .units = "semicircles" },
-        29 => .{ .name = "swc_lat", .units = "semicircles" },
-        30 => .{ .name = "swc_long", .units = "semicircles" },
+        27 => .{ .name = "nec_lat", .kind = .semicircles, .units = "semicircles" },
+        28 => .{ .name = "nec_long", .kind = .semicircles, .units = "semicircles" },
+        29 => .{ .name = "swc_lat", .kind = .semicircles, .units = "semicircles" },
+        30 => .{ .name = "swc_long", .kind = .semicircles, .units = "semicircles" },
         25 => .{ .name = "sport" },
         else => null,
     };
@@ -197,12 +237,12 @@ fn lap(field_definition_number: u8) ?FieldProfile {
 fn session(field_definition_number: u8) ?FieldProfile {
     return switch (field_definition_number) {
         254 => .{ .name = "message_index" },
-        253 => .{ .name = "timestamp", .units = "s" },
+        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
         0 => .{ .name = "event" },
         1 => .{ .name = "event_type" },
-        2 => .{ .name = "start_time", .units = "s" },
-        3 => .{ .name = "start_position_lat", .units = "semicircles" },
-        4 => .{ .name = "start_position_long", .units = "semicircles" },
+        2 => .{ .name = "start_time", .kind = .date_time, .units = "s" },
+        3 => .{ .name = "start_position_lat", .kind = .semicircles, .units = "semicircles" },
+        4 => .{ .name = "start_position_long", .kind = .semicircles, .units = "semicircles" },
         5 => .{ .name = "sport" },
         6 => .{ .name = "sub_sport" },
         7 => .{ .name = "total_elapsed_time", .units = "s", .scale = 1000 },
@@ -223,12 +263,12 @@ fn session(field_definition_number: u8) ?FieldProfile {
         25 => .{ .name = "first_lap_index" },
         26 => .{ .name = "num_laps" },
         28 => .{ .name = "trigger" },
-        29 => .{ .name = "nec_lat", .units = "semicircles" },
-        30 => .{ .name = "nec_long", .units = "semicircles" },
-        31 => .{ .name = "swc_lat", .units = "semicircles" },
-        32 => .{ .name = "swc_long", .units = "semicircles" },
-        38 => .{ .name = "end_position_lat", .units = "semicircles" },
-        39 => .{ .name = "end_position_long", .units = "semicircles" },
+        29 => .{ .name = "nec_lat", .kind = .semicircles, .units = "semicircles" },
+        30 => .{ .name = "nec_long", .kind = .semicircles, .units = "semicircles" },
+        31 => .{ .name = "swc_lat", .kind = .semicircles, .units = "semicircles" },
+        32 => .{ .name = "swc_long", .kind = .semicircles, .units = "semicircles" },
+        38 => .{ .name = "end_position_lat", .kind = .semicircles, .units = "semicircles" },
+        39 => .{ .name = "end_position_long", .kind = .semicircles, .units = "semicircles" },
         110 => .{ .name = "sport_profile_name" },
         124 => .{ .name = "enhanced_avg_speed", .units = "m/s", .scale = 1000 },
         125 => .{ .name = "enhanced_max_speed", .units = "m/s", .scale = 1000 },
@@ -238,13 +278,13 @@ fn session(field_definition_number: u8) ?FieldProfile {
 
 fn activity(field_definition_number: u8) ?FieldProfile {
     return switch (field_definition_number) {
-        253 => .{ .name = "timestamp", .units = "s" },
+        253 => .{ .name = "timestamp", .kind = .date_time, .units = "s" },
         0 => .{ .name = "total_timer_time", .units = "s", .scale = 1000 },
         1 => .{ .name = "num_sessions" },
         2 => .{ .name = "type" },
         3 => .{ .name = "event" },
         4 => .{ .name = "event_type" },
-        5 => .{ .name = "local_timestamp", .units = "s" },
+        5 => .{ .name = "local_timestamp", .kind = .local_date_time, .units = "s" },
         6 => .{ .name = "event_group" },
         else => null,
     };
@@ -293,6 +333,18 @@ test "field_profile: every entry is well-formed and names are unique per message
             const profile = field_profile(global, @intCast(field_number)) orelse continue;
             try testing.expect(profile.name.len > 0);
             try testing.expect(profile.scale >= 1);
+            // A converted field is never also scaled, and its units describe the raw value.
+            switch (profile.kind) {
+                .number => {},
+                .date_time, .local_date_time => {
+                    try testing.expect(!profile.is_scaled());
+                    try testing.expectEqualStrings("s", profile.units);
+                },
+                .semicircles => {
+                    try testing.expect(!profile.is_scaled());
+                    try testing.expectEqualStrings("semicircles", profile.units);
+                },
+            }
             for (profile.name) |character| {
                 try testing.expect(std.ascii.isLower(character) or
                     std.ascii.isDigit(character) or character == '_');
@@ -311,6 +363,8 @@ test "FieldProfile.scaled: scale, offset and non-numeric values" {
     const altitude = FieldProfile{ .name = "altitude", .scale = 5, .offset = 500 };
     try testing.expectEqual(@as(?f64, 792), altitude.scaled(.{ .unsigned = 6460 }));
     try testing.expectEqual(@as(?f64, -500), altitude.scaled(.{ .unsigned = 0 }));
+    // 2621 / 5 - 500 in that order gives 24.200000000000045.
+    try testing.expectEqual(@as(?f64, 24.2), altitude.scaled(.{ .unsigned = 2621 }));
 
     const grade = FieldProfile{ .name = "grade", .scale = 100 };
     try testing.expectEqual(@as(?f64, -2.5), grade.scaled(.{ .signed = -250 }));
@@ -321,4 +375,33 @@ test "FieldProfile.scaled: scale, offset and non-numeric values" {
 
     try testing.expectEqual(@as(?f64, null), grade.scaled(.{ .string = "x" }));
     try testing.expectEqual(@as(?f64, null), grade.scaled(.{ .bytes = &.{1} }));
+}
+
+test "field_profile: dates and positions carry their kind" {
+    try testing.expectEqual(Kind.date_time, field_profile(20, 253).?.kind);
+    try testing.expectEqual(Kind.date_time, field_profile(0, 4).?.kind);
+    try testing.expectEqual(Kind.date_time, field_profile(18, 2).?.kind);
+    try testing.expectEqual(Kind.local_date_time, field_profile(34, 5).?.kind);
+    try testing.expectEqual(Kind.semicircles, field_profile(20, 0).?.kind);
+    try testing.expectEqual(Kind.semicircles, field_profile(18, 39).?.kind);
+    // A duration in seconds is a number, not a date.
+    try testing.expectEqual(Kind.number, field_profile(18, 7).?.kind);
+    try testing.expectEqual(Kind.number, field_profile(20, 3).?.kind);
+}
+
+test "date_time_unix_s: absolute dates and time since power-on" {
+    try testing.expectEqual(@as(?u64, 631065600 + 1159179174), date_time_unix_s(1159179174));
+    try testing.expectEqual(@as(?u64, 631065600 + 0x10000000), date_time_unix_s(0x10000000));
+    try testing.expectEqual(@as(?u64, null), date_time_unix_s(0x0FFFFFFF));
+    try testing.expectEqual(@as(?u64, null), date_time_unix_s(0));
+    const max = std.math.maxInt(u32);
+    try testing.expectEqual(@as(?u64, 631065600 + max), date_time_unix_s(max));
+}
+
+test "semicircles_degrees" {
+    try testing.expectEqual(@as(f64, 0), semicircles_degrees(0));
+    try testing.expectEqual(@as(f64, 90), semicircles_degrees(1 << 30));
+    try testing.expectEqual(@as(f64, -180), semicircles_degrees(-(1 << 31)));
+    try testing.expectApproxEqAbs(@as(f64, 45.026082), semicircles_degrees(537182079), 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, -0.808959), semicircles_degrees(-9651251), 1e-6);
 }

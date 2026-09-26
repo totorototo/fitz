@@ -6,10 +6,13 @@ const fitz = @import("fitz");
 const file_size_max = 64 * 1024 * 1024;
 
 const usage =
-    \\usage: fitz [--dump] <file.fit>
-    \\  --dump  print every data message's decoded fields to stdout; well-known
-    \\          messages and fields are named, scaled and given units
-    \\  via build: zig build run -- [--dump] <file.fit>
+    \\usage: fitz [--dump [--all]] <file.fit>
+    \\  --dump  print each data message to stdout, one line per message, showing the fields
+    \\          the built-in profile knows and that hold data: named, scaled, with units,
+    \\          dates in ISO 8601 and positions in degrees
+    \\  --all   with --dump, print every field instead: "no data" as -, unknown fields by
+    \\          number, and dates and positions as stored (seconds, semicircles)
+    \\  via build: zig build run -- [--dump [--all]] <file.fit>
     \\
 ;
 
@@ -33,8 +36,21 @@ const RecordCounts = struct {
     compressed_timestamp: u32 = 0,
 };
 
+const DumpDetail = enum {
+    /// Known fields with data, converted for reading.
+    readable,
+    /// Every field, as stored.
+    all,
+};
+
+const Dump = struct {
+    writer: *std.Io.Writer,
+    detail: DumpDetail,
+};
+
 const Options = struct {
-    dump: bool,
+    /// Null when no dump was asked for, so `--all` without `--dump` can't be represented.
+    dump: ?DumpDetail,
     path: []const u8,
 };
 
@@ -89,36 +105,54 @@ pub fn main(init: std.process.Init) !void {
     // summary stay on stderr.
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
-    const dump_writer: ?*std.Io.Writer = if (options.dump) &stdout_writer.interface else null;
+    const dump: ?Dump = if (options.dump) |detail|
+        .{ .writer = &stdout_writer.interface, .detail = detail }
+    else
+        null;
 
     var data_counts = std.AutoHashMap(u16, u32).init(allocator);
     defer data_counts.deinit();
-    const record_counts = try records_process(&parser, dump_writer, &data_counts);
-    if (dump_writer) |writer| try writer.flush();
+    const record_counts = try records_process(&parser, dump, &data_counts);
+    if (dump) |active| try active.writer.flush();
 
     counts_print(&record_counts, &data_counts, buffer.len);
 }
 
-/// Accepts exactly `<path>` or `--dump <path>`. Returns null on any other shape.
+/// Accepts `[--dump [--all]] <path>`, with each flag at most once, in either order. Returns
+/// null on any other shape.
 fn options_parse(arguments: []const [:0]const u8) ?Options {
-    const options: Options = switch (arguments.len) {
-        2 => .{ .dump = false, .path = arguments[1] },
-        3 => if (std.mem.eql(u8, arguments[1], "--dump"))
-            .{ .dump = true, .path = arguments[2] }
-        else
-            return null,
-        else => return null,
-    };
+    if (arguments.len < 2 or arguments.len > 4) return null;
+    const path = arguments[arguments.len - 1];
+
+    var dump = false;
+    var all = false;
+    // Bounded: at most two flags, by the length check above.
+    for (arguments[1 .. arguments.len - 1]) |flag| {
+        if (std.mem.eql(u8, flag, "--dump") and !dump) {
+            dump = true;
+        } else if (std.mem.eql(u8, flag, "--all") and !all) {
+            all = true;
+        } else {
+            return null;
+        }
+    }
+    // `--all` only changes what `--dump` prints.
+    if (all and !dump) return null;
     // An empty path, or a flag in the path position, is a usage mistake, not a file name.
-    if (options.path.len == 0) return null;
-    if (std.mem.startsWith(u8, options.path, "--")) return null;
+    if (path.len == 0) return null;
+    if (std.mem.startsWith(u8, path, "--")) return null;
+
+    const options = Options{
+        .dump = if (!dump) null else if (all) .all else .readable,
+        .path = path,
+    };
     assert(options.path.ptr == arguments[arguments.len - 1].ptr);
     return options;
 }
 
 fn records_process(
     parser: *fitz.Parser,
-    dump_writer: ?*std.Io.Writer,
+    dump: ?Dump,
     data_counts: *std.AutoHashMap(u16, u32),
 ) !RecordCounts {
     assert(data_counts.count() == 0);
@@ -144,7 +178,7 @@ fn records_process(
                 const entry = try data_counts.getOrPutValue(data.global_message_number, 0);
                 entry.value_ptr.* += 1;
                 if (data.compressed_timestamp != null) record_counts.compressed_timestamp += 1;
-                if (dump_writer) |writer| try data_message_write(writer, &data);
+                if (dump) |active| try data_message_write(active.writer, &data, active.detail);
             },
         }
     }
@@ -177,40 +211,74 @@ fn counts_print(
     );
 }
 
-/// One line per data message: `DATA local=L global_msg=G field=value ...`, where G and each
-/// field are named when the profile knows them.
-fn data_message_write(writer: *std.Io.Writer, data: *const fitz.DataMessage) !void {
+/// One line per data message: `DATA local=L global_msg=G field=value ...`. In readable
+/// detail, only fields the profile knows and that hold at least one value are printed.
+fn data_message_write(
+    writer: *std.Io.Writer,
+    data: *const fitz.DataMessage,
+    detail: DumpDetail,
+) !void {
     try writer.print("DATA local={d} global_msg={f}", .{
         data.local_message_type,
         MessageLabel{ .global_message_number = data.global_message_number },
     });
     // A compressed header's timestamp isn't one of the message's fields, so it is printed
     // first, the way a normal message's field 253 would be.
-    if (data.compressed_timestamp) |timestamp| try writer.print(" timestamp={d}s", .{timestamp});
+    if (data.compressed_timestamp) |timestamp| {
+        try writer.writeAll(" timestamp=");
+        switch (detail) {
+            .readable => try date_time_write(writer, timestamp, .utc),
+            .all => try writer.print("{d}s", .{timestamp}),
+        }
+    }
 
     var fields_written: usize = 0;
+    var fields_skipped: usize = 0;
     var iterator = data.fields_iterator();
     // Bounded by the definition's field count, at most 255.
     while (iterator.next()) |field| {
+        const field_profile = fitz.profile.field_profile(
+            data.global_message_number,
+            field.field_definition_number,
+        );
+        const shown = switch (detail) {
+            .readable => field_profile != null and field_has_data(&field),
+            .all => true,
+        };
+        if (!shown) {
+            fields_skipped += 1;
+            continue;
+        }
         try writer.writeByte(' ');
-        try field_write(writer, &field, data.global_message_number);
+        try field_write(writer, &field, if (field_profile) |*profile| profile else null, detail);
         fields_written += 1;
     }
-    assert(fields_written == data.fields.len);
+    assert(fields_written + fields_skipped == data.fields.len);
+    assert(detail == .readable or fields_skipped == 0);
     try writer.writeByte('\n');
+}
+
+/// True when at least one element isn't the base type's "no data" sentinel.
+fn field_has_data(field: *const fitz.Field) bool {
+    const element_count = field.element_count();
+    assert(element_count >= 1);
+    var index: u8 = 0;
+    while (index < element_count) : (index += 1) {
+        if (field.element(index) != null) return true;
+    }
+    return false;
 }
 
 /// `name=value` for a single element, `name=[a,b,...]` for an array, followed by the units.
 /// A field the profile doesn't know is printed by number, raw and without units.
-fn field_write(writer: *std.Io.Writer, field: *const fitz.Field, global_message_number: u16) !void {
+fn field_write(
+    writer: *std.Io.Writer,
+    field: *const fitz.Field,
+    field_profile: ?*const fitz.profile.FieldProfile,
+    detail: DumpDetail,
+) !void {
     const element_count = field.element_count();
     assert(element_count >= 1);
-    const field_profile = fitz.profile.field_profile(
-        global_message_number,
-        field.field_definition_number,
-    );
-    const profile_pointer: ?*const fitz.profile.FieldProfile =
-        if (field_profile) |*profile| profile else null;
 
     if (field_profile) |profile| {
         try writer.writeAll(profile.name);
@@ -222,28 +290,35 @@ fn field_write(writer: *std.Io.Writer, field: *const fitz.Field, global_message_
     if (element_count == 1) {
         // A single "no data" value gets no units: `heart_rate=-`, not `heart_rate=-bpm`.
         const value = field.element(0) orelse return writer.writeByte('-');
-        try element_write(writer, value, profile_pointer);
+        try element_write(writer, value, field_profile, detail);
     } else {
         try writer.writeByte('[');
         var index: u8 = 0;
         while (index < element_count) : (index += 1) {
             if (index > 0) try writer.writeByte(',');
-            try element_write(writer, field.element(index), profile_pointer);
+            try element_write(writer, field.element(index), field_profile, detail);
         }
         try writer.writeByte(']');
     }
-    if (field_profile) |profile| try writer.writeAll(profile.units);
+    // A converted date or position carries its own notation instead of the raw units.
+    const profile = field_profile orelse return;
+    if (detail == .all or profile.kind == .number) try writer.writeAll(profile.units);
 }
 
 /// Invalid (sentinel) elements print as `-`, so "no data" never looks like a real number.
-/// A scaled field prints its physical value; everything else prints the raw value exactly.
+/// In readable detail, dates and positions are converted; a scaled field prints its physical
+/// value; everything else prints the raw value exactly.
 fn element_write(
     writer: *std.Io.Writer,
     value: ?fitz.Value,
     field_profile: ?*const fitz.profile.FieldProfile,
+    detail: DumpDetail,
 ) !void {
     const present = value orelse return writer.writeByte('-');
     if (field_profile) |profile| {
+        if (detail == .readable and profile.kind != .number) {
+            if (try converted_write(writer, present, profile.kind)) return;
+        }
         if (profile.is_scaled()) {
             // A string or byte value has nothing to scale, so it falls through to the raw form.
             if (profile.scaled(present)) |scaled| return writer.print("{d}", .{scaled});
@@ -258,16 +333,84 @@ fn element_write(
     }
 }
 
+/// Writes a date or a position in readable form. Returns false, having written nothing, when
+/// the file stored the field with a base type that doesn't fit its kind, so the caller prints
+/// the raw value instead of a wrong conversion.
+fn converted_write(
+    writer: *std.Io.Writer,
+    value: fitz.Value,
+    kind: fitz.profile.Kind,
+) std.Io.Writer.Error!bool {
+    switch (kind) {
+        .number => unreachable,
+        .date_time, .local_date_time => {
+            if (value != .unsigned) return false;
+            const date_time = std.math.cast(u32, value.unsigned) orelse return false;
+            const zone: Zone = if (kind == .date_time) .utc else .local;
+            try date_time_write(writer, date_time, zone);
+        },
+        .semicircles => {
+            if (value != .signed) return false;
+            const degrees = fitz.profile.semicircles_degrees(@floatFromInt(value.signed));
+            try writer.print("{d:.6}°", .{degrees});
+        },
+    }
+    return true;
+}
+
+const Zone = enum { utc, local };
+
+/// ISO 8601, with a `Z` suffix for UTC and none for local time. A value below
+/// `date_time_absolute_min` is time since power-on, not a date, so it prints as seconds.
+fn date_time_write(writer: *std.Io.Writer, date_time: u32, zone: Zone) !void {
+    const unix_s = fitz.profile.date_time_unix_s(date_time) orelse
+        return writer.print("{d}s", .{date_time});
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = unix_s };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    assert(year_day.year >= 1998 and year_day.year <= 2126);
+
+    try writer.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+        year_day.year,
+        month_day.month.numeric(),
+        @as(u8, month_day.day_index) + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
+    switch (zone) {
+        .utc => try writer.writeByte('Z'),
+        .local => {},
+    }
+}
+
 const testing = std.testing;
 
 test "options_parse" {
     const plain = options_parse(&.{ "fitz", "a.fit" }).?;
-    try testing.expect(!plain.dump);
+    try testing.expectEqual(@as(?DumpDetail, null), plain.dump);
     try testing.expectEqualStrings("a.fit", plain.path);
 
     const dump = options_parse(&.{ "fitz", "--dump", "a.fit" }).?;
-    try testing.expect(dump.dump);
+    try testing.expectEqual(@as(?DumpDetail, .readable), dump.dump);
     try testing.expectEqualStrings("a.fit", dump.path);
+
+    const all = options_parse(&.{ "fitz", "--dump", "--all", "a.fit" }).?;
+    try testing.expectEqual(@as(?DumpDetail, .all), all.dump);
+    const all_swapped = options_parse(&.{ "fitz", "--all", "--dump", "a.fit" }).?;
+    try testing.expectEqual(@as(?DumpDetail, .all), all_swapped.dump);
+
+    // `--all` alone, repeated flags, and a flag as the path.
+    try testing.expectEqual(@as(?Options, null), options_parse(&.{ "fitz", "--all", "a.fit" }));
+    const dump_twice = options_parse(&.{ "fitz", "--dump", "--dump", "a.fit" });
+    try testing.expectEqual(@as(?Options, null), dump_twice);
+    const all_twice = options_parse(&.{ "fitz", "--all", "--all", "a.fit" });
+    try testing.expectEqual(@as(?Options, null), all_twice);
+    const flag_path = options_parse(&.{ "fitz", "--dump", "--all" });
+    try testing.expectEqual(@as(?Options, null), flag_path);
+    const too_many = options_parse(&.{ "fitz", "--dump", "--all", "--all", "a.fit" });
+    try testing.expectEqual(@as(?Options, null), too_many);
 
     try testing.expectEqual(@as(?Options, null), options_parse(&.{"fitz"}));
     try testing.expectEqual(@as(?Options, null), options_parse(&.{ "fitz", "" }));
@@ -292,7 +435,7 @@ test "element_write: every representation and the invalid marker" {
     };
     for (cases) |case| {
         var writer = std.Io.Writer.fixed(&buffer);
-        try element_write(&writer, case.value, null);
+        try element_write(&writer, case.value, null, .all);
         try testing.expectEqualStrings(case.expected, writer.buffered());
     }
 }
@@ -316,7 +459,7 @@ test "data_message_write: an unknown message prints numbers and raw values" {
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data);
+    try data_message_write(&writer, &data, .all);
     try testing.expectEqualStrings(
         "DATA local=1 global_msg=325 253=1 5=[7,-,9] 7=- 200=42\n",
         writer.buffered(),
@@ -336,7 +479,7 @@ test "data_message_write: a known message prints names, scaled values and units"
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data);
+    try data_message_write(&writer, &data, .all);
     try testing.expectEqualStrings(
         "DATA local=1 global_msg=record timestamp=1s distance=[0.07,-,0.09]m power=- 200=42\n",
         writer.buffered(),
@@ -348,15 +491,15 @@ test "element_write: scaled values, and a string in a scaled field" {
     var buffer: [64]u8 = undefined;
 
     var writer = std.Io.Writer.fixed(&buffer);
-    try element_write(&writer, .{ .unsigned = 6460 }, &altitude);
+    try element_write(&writer, .{ .unsigned = 6460 }, &altitude, .readable);
     try testing.expectEqualStrings("792", writer.buffered());
 
     writer = std.Io.Writer.fixed(&buffer);
-    try element_write(&writer, .{ .string = "odd" }, &altitude);
+    try element_write(&writer, .{ .string = "odd" }, &altitude, .readable);
     try testing.expectEqualStrings("\"odd\"", writer.buffered());
 
     writer = std.Io.Writer.fixed(&buffer);
-    try element_write(&writer, null, &altitude);
+    try element_write(&writer, null, &altitude, .readable);
     try testing.expectEqualStrings("-", writer.buffered());
 }
 
@@ -381,7 +524,7 @@ test "data_message_write: a message with no fields" {
     };
     var buffer: [64]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data);
+    try data_message_write(&writer, &data, .all);
     try testing.expectEqualStrings("DATA local=0 global_msg=file_id\n", writer.buffered());
 }
 
@@ -399,9 +542,133 @@ test "data_message_write: a compressed timestamp is printed before the fields" {
     };
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try data_message_write(&writer, &data);
+    try data_message_write(&writer, &data, .all);
     try testing.expectEqualStrings(
         "DATA local=1 global_msg=record timestamp=1147594040s heart_rate=146bpm\n",
         writer.buffered(),
     );
+}
+
+test "data_message_write: readable detail hides empty and unknown fields and converts" {
+    const fields = [_]fitz.FieldDefinition{
+        .{ .field_definition_number = 253, .size = 4, .base_type = .uint32 },
+        .{ .field_definition_number = 0, .size = 4, .base_type = .sint32 },
+        .{ .field_definition_number = 1, .size = 4, .base_type = .sint32 },
+        .{ .field_definition_number = 3, .size = 1, .base_type = .uint8 },
+        .{ .field_definition_number = 7, .size = 2, .base_type = .uint16 },
+        .{ .field_definition_number = 200, .size = 1, .base_type = .uint8 },
+        .{ .field_definition_number = 78, .size = 4, .base_type = .uint32 },
+    };
+    var raw: [24]u8 = undefined;
+    std.mem.writeInt(u32, raw[0..4], 1159179174, .little); // timestamp
+    std.mem.writeInt(i32, raw[4..8], 537182079, .little); // position_lat
+    std.mem.writeInt(i32, raw[8..12], -9651251, .little); // position_long
+    raw[12] = 157; // heart_rate
+    std.mem.writeInt(u16, raw[13..15], 0xFFFF, .little); // power: no data, hidden
+    raw[15] = 42; // unknown field 200, hidden
+    std.mem.writeInt(u32, raw[16..20], 6460, .little); // enhanced_altitude
+    std.mem.writeInt(u32, raw[20..24], 0, .little); // Padding outside the message.
+
+    const data = fitz.DataMessage{
+        .local_message_type = 3,
+        .global_message_number = 20,
+        .big_endian = false,
+        .compressed_timestamp = null,
+        .fields = &fields,
+        .raw = raw[0..20],
+    };
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &data, .readable);
+    try testing.expectEqualStrings(
+        "DATA local=3 global_msg=record timestamp=2026-09-24T10:12:54Z " ++
+            "position_lat=45.026082° position_long=-0.808959° heart_rate=157bpm " ++
+            "enhanced_altitude=792m\n",
+        writer.buffered(),
+    );
+
+    // The same message in full detail keeps every field, raw dates and positions.
+    writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &data, .all);
+    try testing.expectEqualStrings(
+        "DATA local=3 global_msg=record timestamp=1159179174s " ++
+            "position_lat=537182079semicircles position_long=-9651251semicircles " ++
+            "heart_rate=157bpm power=- 200=42 enhanced_altitude=792m\n",
+        writer.buffered(),
+    );
+}
+
+test "data_message_write: a readable compressed timestamp is a date" {
+    const data = fitz.DataMessage{
+        .local_message_type = 1,
+        .global_message_number = 325,
+        .big_endian = false,
+        .compressed_timestamp = 1159179174,
+        .fields = &.{},
+        .raw = &.{},
+    };
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &data, .readable);
+    try testing.expectEqualStrings(
+        "DATA local=1 global_msg=325 timestamp=2026-09-24T10:12:54Z\n",
+        writer.buffered(),
+    );
+}
+
+test "field_has_data: all, some or none of the elements" {
+    const empty = fitz.Field{
+        .field_definition_number = 116,
+        .base_type = .uint16,
+        .endian = .little,
+        .raw = &.{ 0xFF, 0xFF, 0xFF, 0xFF },
+    };
+    try testing.expect(!field_has_data(&empty));
+    const partial = fitz.Field{
+        .field_definition_number = 116,
+        .base_type = .uint16,
+        .endian = .little,
+        .raw = &.{ 0xFF, 0xFF, 1, 0 },
+    };
+    try testing.expect(field_has_data(&partial));
+    const empty_string = fitz.Field{
+        .field_definition_number = 110,
+        .base_type = .string,
+        .endian = .little,
+        .raw = &.{ 0, 0 },
+    };
+    try testing.expect(!field_has_data(&empty_string));
+}
+
+test "date_time_write: UTC, local, bounds and time since power-on" {
+    const cases = [_]struct { date_time: u32, zone: Zone, expected: []const u8 }{
+        .{ .date_time = 1159179174, .zone = .utc, .expected = "2026-09-24T10:12:54Z" },
+        .{ .date_time = 1159179174, .zone = .local, .expected = "2026-09-24T10:12:54" },
+        .{ .date_time = 1147594034, .zone = .utc, .expected = "2026-05-13T08:07:14Z" },
+        // The first absolute date_time, and the largest valid one (0xFFFFFFFF is "no data").
+        .{ .date_time = 0x10000000, .zone = .utc, .expected = "1998-07-03T21:24:16Z" },
+        .{ .date_time = 0xFFFFFFFE, .zone = .utc, .expected = "2126-02-06T06:28:14Z" },
+        // Just below the threshold: seconds since the device powered on.
+        .{ .date_time = 0x0FFFFFFF, .zone = .utc, .expected = "268435455s" },
+        .{ .date_time = 0, .zone = .local, .expected = "0s" },
+    };
+    var buffer: [32]u8 = undefined;
+    for (cases) |case| {
+        var writer = std.Io.Writer.fixed(&buffer);
+        try date_time_write(&writer, case.date_time, case.zone);
+        try testing.expectEqualStrings(case.expected, writer.buffered());
+    }
+}
+
+test "converted_write: a base type that doesn't fit the kind falls back to raw" {
+    var buffer: [32]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try testing.expect(!try converted_write(&writer, .{ .signed = 5 }, .date_time));
+    try testing.expect(!try converted_write(&writer, .{ .unsigned = 1 << 32 }, .date_time));
+    try testing.expect(!try converted_write(&writer, .{ .unsigned = 5 }, .semicircles));
+    try testing.expect(!try converted_write(&writer, .{ .string = "x" }, .semicircles));
+    try testing.expectEqualStrings("", writer.buffered());
+
+    try testing.expect(try converted_write(&writer, .{ .signed = 1 << 30 }, .semicircles));
+    try testing.expectEqualStrings("90.000000°", writer.buffered());
 }
