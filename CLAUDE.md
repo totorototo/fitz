@@ -22,7 +22,8 @@ at a time, not all at once.
   (fitparse's tests/CSV, or cross-checks within the file), not from fitz's own output. Never
   commit personal recordings (GPS and health data).
 - **Current scope**: file header, chained files in one buffer (all verified in `Parser.init`,
-  each with its own definitions; `file_index`/`file_count`), header and file CRC-16
+  each with its own definitions; `file_index`/`file_count`, and `next_in_file`/`file_advance`
+  to stop at each file), header and file CRC-16
   verification, normal and compressed-timestamp record headers (compressed timestamps are rebuilt against
   the latest field 253), definition messages, and data messages with base-type value decoding
   (`Field.element` returns a typed `Value`, or null for the base type's invalid sentinel).

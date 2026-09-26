@@ -876,26 +876,39 @@ pub const Parser = struct {
         assert(self.end + crc_size <= self.buffer.len);
     }
 
-    /// Moves to the next chained file. Its local message types and timestamps are its own.
-    fn file_next(self: *Parser) void {
+    /// Moves to the next chained file once `next_in_file` has returned null for this one, and
+    /// returns false, staying put, after the last file. The next file's local message types,
+    /// timestamps and developer field descriptions are its own. Calling it with records left in
+    /// the current file is a bug in the caller.
+    pub fn file_advance(self: *Parser) bool {
+        self.assert_invariants();
         assert(self.position == self.end);
-        assert(self.file_index + 1 < self.file_count);
+        if (self.file_index + 1 == self.file_count) return false;
         self.definitions = .{null} ** local_message_type_count;
         self.timestamp_reference = null;
         self.developer_field_descriptions.clear();
         self.file_index += 1;
         self.file_load(self.end + crc_size);
+        assert(self.position == self.file_start + self.header.data_start());
         self.assert_invariants();
+        return true;
     }
 
-    /// Returns the next record, or null once the data section of the last file is exhausted.
+    /// Returns the next record of every chained file in turn, or null after the last file.
+    /// A caller that needs to see each file, an empty one included, uses `next_in_file` and
+    /// `file_advance` instead.
     pub fn next(self: *Parser) FitError!?Record {
-        self.assert_invariants();
-        // A loop, because a chained file may have an empty data section. Bounded by file_count.
-        while (self.position == self.end) {
-            if (self.file_index + 1 == self.file_count) return null;
-            self.file_next();
+        // Bounded: each pass either returns or moves to a later file.
+        while (true) {
+            if (try self.next_in_file()) |record| return record;
+            if (!self.file_advance()) return null;
         }
+    }
+
+    /// Returns the next record of the current file, or null once its data section is exhausted.
+    pub fn next_in_file(self: *Parser) FitError!?Record {
+        self.assert_invariants();
+        if (self.position == self.end) return null;
 
         const position_before = self.position;
         const header_byte = self.buffer[self.position];
@@ -1574,6 +1587,33 @@ test "Parser: reads chained files in order, an empty one included" {
     try testing.expectEqual(@as(?Record, null), try parser.next());
     try testing.expectEqual(@as(?Record, null), try parser.next());
     try testing.expectEqual(@as(u32, 2), parser.file_index);
+}
+
+test "Parser: next_in_file and file_advance stop at every file, an empty one included" {
+    const buffer = try test_files_chain(testing.allocator, &.{
+        &test_definition_local_0 ++ test_data_local_0,
+        &.{},
+        &test_definition_local_0,
+    });
+    defer testing.allocator.free(buffer);
+
+    var parser = try Parser.init(testing.allocator, buffer);
+    defer parser.deinit();
+    var records_per_file: [3]u32 = .{ 0, 0, 0 };
+    // Bounded by the file count.
+    while (true) {
+        while (try parser.next_in_file()) |_| records_per_file[parser.file_index] += 1;
+        // The file stays exhausted until the caller moves on.
+        try testing.expectEqual(@as(?Record, null), try parser.next_in_file());
+        if (!parser.file_advance()) break;
+    }
+    try testing.expectEqualSlices(u32, &.{ 2, 0, 1 }, &records_per_file);
+
+    // After the last file, nothing moves.
+    try testing.expectEqual(@as(u32, 2), parser.file_index);
+    try testing.expect(!parser.file_advance());
+    try testing.expectEqual(@as(u32, 2), parser.file_index);
+    try testing.expectEqual(@as(?Record, null), try parser.next());
 }
 
 test "Parser: a chained file doesn't inherit definitions or the timestamp reference" {

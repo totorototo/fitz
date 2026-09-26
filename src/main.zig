@@ -102,7 +102,6 @@ pub fn main(init: std.process.Init) !void {
     var data_counts = std.AutoHashMap(u16, u32).init(allocator);
     defer data_counts.deinit();
     assert(parser.file_index == 0);
-    try file_started(&parser, dump);
     const record_counts = try records_process(&parser, dump, &data_counts);
     if (dump) |active| try active.writer.flush();
 
@@ -110,9 +109,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Announces the file the parser is in: its header line on stderr and, when the buffer chains
-/// several files, a marker in the dump. Called for the first file before any record, then when
-/// a record comes from a new file. An empty chained file has no records, so it isn't announced;
-/// the numbering shows the gap.
+/// several files, a marker in the dump. Called as the parser enters each file, before its
+/// records, so an empty chained file is announced too.
 fn file_started(parser: *const fitz.Parser, dump: ?Dump) !void {
     assert(parser.file_index < parser.file_count);
     var line_buffer: [file_header_line_size_max]u8 = undefined;
@@ -214,47 +212,57 @@ fn records_process(
     assert(data_counts.count() == 0);
     var record_counts = RecordCounts{};
 
-    var file_index = parser.file_index;
-    // Bounded: every record consumes at least one byte of a data section of at most
-    // file_size_max bytes.
-    while (try parser.next()) |record| {
-        if (parser.file_index != file_index) {
-            assert(parser.file_index > file_index);
-            file_index = parser.file_index;
-            try file_started(parser, dump);
+    // Bounded by the file count, and each file's records by its data size.
+    while (true) {
+        try file_started(parser, dump);
+        while (try parser.next_in_file()) |record| {
+            try record_process(parser, &record, dump, data_counts, &record_counts);
         }
-        switch (record) {
-            .definition => |definition| {
-                record_counts.definition += 1;
-                std.debug.print(
-                    "DEF  local={d} global_msg={f} fields={d} developer_fields={d} " ++
-                        "big_endian={}\n",
-                    .{
-                        definition.local_message_type,
-                        MessageLabel{ .global_message_number = definition.global_message_number },
-                        definition.fields.len,
-                        definition.developer_fields.len,
-                        definition.big_endian,
-                    },
-                );
-            },
-            .data => |data| {
-                const entry = try data_counts.getOrPutValue(data.global_message_number, 0);
-                entry.value_ptr.* += 1;
-                if (data.compressed_timestamp != null) record_counts.compressed_timestamp += 1;
-                if (data.developer_fields.len > 0) record_counts.developer_fields += 1;
-                if (dump) |active| try data_message_write(
-                    active.writer,
-                    &data,
-                    &parser.developer_field_descriptions,
-                    active.detail,
-                );
-            },
-        }
+        if (!parser.file_advance()) break;
     }
+    assert(parser.file_index + 1 == parser.file_count);
     // The parser rejects a data message whose local type was never defined.
     assert(record_counts.definition > 0 or data_counts.count() == 0);
     return record_counts;
+}
+
+fn record_process(
+    parser: *const fitz.Parser,
+    record: *const fitz.Record,
+    dump: ?Dump,
+    data_counts: *std.AutoHashMap(u16, u32),
+    record_counts: *RecordCounts,
+) !void {
+    assert(parser.file_index < parser.file_count);
+    switch (record.*) {
+        .definition => |definition| {
+            record_counts.definition += 1;
+            std.debug.print(
+                "DEF  local={d} global_msg={f} fields={d} developer_fields={d} " ++
+                    "big_endian={}\n",
+                .{
+                    definition.local_message_type,
+                    MessageLabel{ .global_message_number = definition.global_message_number },
+                    definition.fields.len,
+                    definition.developer_fields.len,
+                    definition.big_endian,
+                },
+            );
+        },
+        .data => |data| {
+            const entry = try data_counts.getOrPutValue(data.global_message_number, 0);
+            entry.value_ptr.* += 1;
+            assert(entry.value_ptr.* >= 1);
+            if (data.compressed_timestamp != null) record_counts.compressed_timestamp += 1;
+            if (data.developer_fields.len > 0) record_counts.developer_fields += 1;
+            if (dump) |active| try data_message_write(
+                active.writer,
+                &data,
+                &parser.developer_field_descriptions,
+                active.detail,
+            );
+        },
+    }
 }
 
 fn counts_print(

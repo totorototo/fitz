@@ -64,7 +64,7 @@ with a compressed-timestamp header gets
 its rebuilt timestamp printed first, and the summary counts how many
 there were. When the buffer chains several files, each one's messages
 follow a marker: a `file 2 of 3` block, or a `FILE 2/3` line with
-`--all`. An empty chained file has no marker, so its number is skipped.
+`--all`. An empty chained file gets its header line and marker too.
 
 Targets Zig 0.16.0 (explicit `std.Io`, `std.process.Init` main,
 unmanaged containers). Only `main.zig` does I/O; `fit.zig` parses an
@@ -132,7 +132,10 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   an activity followed by settings) in turn. `Parser.init` checks every
   file first, so a bad later file rejects the whole buffer before any
   record. Each file starts with no definitions and no timestamp reference;
-  `parser.file_index` / `file_count` tell the files apart. Every byte must
+  `parser.file_index` / `file_count` tell the files apart. `next()` walks
+  every file in turn; `next_in_file()` stops at the end of each one, and
+  `file_advance()` moves on, so a caller sees every file, an empty one
+  included. Every byte must
   belong to a file: trailing bytes that aren't a whole valid file are an
   error, not ignored
 - Verifies CRC-16 (CRC-16/ARC, as in the FIT SDK) in `Parser.init`, for
