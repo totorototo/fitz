@@ -127,7 +127,9 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   Enum values stay numeric (`sport=1`, not `running`)
 - Strict on base types: a non-canonical base type byte (e.g. `0x04`
   instead of `0x84`) or a field size that isn't a multiple of its base
-  type size is rejected, where the FIT SDK falls back to a byte array
+  type size is rejected, where the FIT SDK falls back to a byte array.
+  This rejects a real Coros Pace 2 file, which declares an event field as a
+  uint32 of size 1 (`testdata/coros-pace-2-cycling-misaligned-fields.fit`)
 - Strict on compressed timestamps: a compressed header before any full
   timestamp, one whose definition also has field 253, or one that would
   overflow `u32` is an error, where the FIT SDK assumes a reference of 0
@@ -143,7 +145,12 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 
 ## Rough next steps
 
-1. Decode developer fields through their field_description messages
+1. Chained FIT files: read every file in the buffer, and reject one with
+   a bad header or CRC. The fixture tests already expect fitparse's 3023
+   messages for `sample_mulitple_header.fit`
+2. Decide whether to relax the base-type policy to the SDK's byte
+   fallback for mis-sized fields (the Coros file above)
+3. Decode developer fields through their field_description messages
    (name, base type, units, scale, offset)
 
 ## Layout
