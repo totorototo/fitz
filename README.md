@@ -12,7 +12,14 @@ by feature rather than all at once.
 zig build            # builds lib + cli into zig-out/
 zig build test       # runs unit tests
 zig build run -- path/to/file.fit
+zig build run -- --dump path/to/file.fit > dump.txt
 ```
+
+Without flags the CLI prints the header and a per-message-type count
+summary to stderr. `--dump` also writes one line per data message to
+stdout, e.g. `DATA local=3 global_msg=20 253=1156215827 3=91 39=- 5=[7,-,9]`:
+`field_number=value`, arrays in brackets, strings quoted, byte fields as
+hex, and `-` for a base type's invalid ("no data") sentinel.
 
 Targets Zig 0.16.0 (explicit `std.Io`, `std.process.Init` main,
 unmanaged containers). Only `main.zig` does I/O; `fit.zig` parses an
@@ -94,5 +101,5 @@ src/
   fit.zig    core parser (Parser, FileHeader, DefinitionMessage, DataMessage, Record)
              and base-type decoding (BaseType, FieldIterator, Field, Value)
   root.zig   library re-exports (`@import("fitz")`)
-  main.zig   CLI: dumps header info + a per-message-type count summary
+  main.zig   CLI: header info, per-message-type counts, `--dump` of decoded fields
 ```

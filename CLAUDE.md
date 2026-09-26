@@ -7,7 +7,7 @@ the binary activity format written by Garmin, Suunto, Coros, Wahoo, etc. It grow
 at a time, not all at once.
 
 - `src/fit.zig`: the core parser. It is pure and does no I/O: it parses an in-memory `[]const u8`.
-- `src/main.zig`: the CLI (`zig build run -- file.fit`). All I/O lives here.
+- `src/main.zig`: the CLI (`zig build run -- [--dump] file.fit`). All I/O lives here.
 - `src/root.zig`: the library entry point.
 - **Current scope**: file header, normal and compressed-timestamp record headers,
   definition messages, and data messages with base-type value decoding (`Field.element`
