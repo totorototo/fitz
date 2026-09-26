@@ -23,6 +23,8 @@ stdout, e.g.
 DATA local=3 global_msg=record timestamp=1147594034s enhanced_altitude=1241.8m heart_rate=146bpm vertical_oscillation=- 140=0
 ```
 
+A message with a compressed-timestamp header gets its rebuilt
+`timestamp=…s` printed first, and the summary counts how many there were.
 Fields the built-in profile knows print as `name=value` plus units, with
 scale and offset applied. Unknown messages and fields keep their numbers
 and raw values. Arrays are in brackets, strings quoted, byte fields hex,
@@ -66,6 +68,10 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 
 - Parses the 12/14-byte file header (`.FIT` signature, sizes, versions)
 - Parses record headers: normal headers and compressed-timestamp headers
+- Rebuilds compressed timestamps (`DataMessage.compressed_timestamp`):
+  the parser keeps the latest full timestamp (field 253 of any message,
+  or the last rebuilt one) and applies each header's 5-bit offset to it,
+  moving to the next 32-second window when the offset wraps
 - Parses definition messages (local message type table, endianness,
   global message number, field definitions)
 - Parses data messages per the matching definition, and decodes each
@@ -89,19 +95,18 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
 - Strict on base types: a non-canonical base type byte (e.g. `0x04`
   instead of `0x84`) or a field size that isn't a multiple of its base
   type size is rejected, where the FIT SDK falls back to a byte array
+- Strict on compressed timestamps: a compressed header before any full
+  timestamp, one whose definition also has field 253, or one that would
+  overflow `u32` is an error, where the FIT SDK assumes a reference of 0
 - No developer field support (returns `DeveloperFieldsUnsupported` if
   encountered)
-- Compressed-timestamp headers are parsed structurally (local message
-  type + 5-bit offset) but the offset isn't yet resolved into an actual
-  timestamp against a running clock
 - No CRC validation (file-level or record-level)
 - No support for chained/concatenated FIT files in one buffer
 
 ## Rough next steps
 
-1. Compressed-timestamp reconstruction
-2. CRC-16 validation (file header CRC and trailing file CRC)
-3. Developer field definitions
+1. CRC-16 validation (file header CRC and trailing file CRC)
+2. Developer field definitions
 
 ## Layout
 

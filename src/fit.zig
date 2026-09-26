@@ -4,9 +4,10 @@
 //! Wahoo, etc.) read and write it too, so nothing here assumes a
 //! Garmin-specific file.
 //!
-//! Scope: file header, record headers (normal + compressed timestamp),
-//! definition messages, and data messages with base-type value decoding.
-//! No profile (message/field names), no developer fields, no CRC checks yet.
+//! Scope: file header, record headers (normal + compressed timestamp, with the
+//! timestamp reconstructed), definition messages, and data messages with base-type
+//! value decoding. Names and scaling live in profile.zig. No developer fields, no
+//! CRC checks yet.
 //!
 //! Errors are for invalid external bytes; assertions are for invariants
 //! the parser itself guarantees. A failed assertion is a bug in this file.
@@ -22,6 +23,13 @@ pub const FitError = error{
     UnknownLocalMessageType,
     InvalidBaseType,
     InvalidFieldSize,
+    /// A compressed-timestamp header appeared before any full timestamp to anchor it.
+    CompressedTimestampWithoutReference,
+    /// A compressed-timestamp message's definition also has a timestamp field (253), so the
+    /// message would carry two timestamps that may disagree.
+    CompressedTimestampWithTimestampField,
+    /// Reconstructing a compressed timestamp would pass the largest u32 timestamp.
+    TimestampOverflow,
     DeveloperFieldsUnsupported,
     OutOfMemory,
 };
@@ -40,6 +48,13 @@ const local_message_type_count = 16;
 const record_header_compressed_mask: u8 = 0x80;
 const record_header_definition_mask: u8 = 0x40;
 const record_header_developer_mask: u8 = 0x20;
+
+/// Field 253 is the timestamp in every FIT message: a uint32 count of seconds since the FIT
+/// epoch (1989-12-31 00:00:00 UTC). It is protocol-level, not profile data.
+pub const timestamp_field_number: u8 = 253;
+/// A compressed header carries only the low 5 bits of the timestamp.
+const compressed_timestamp_mask: u32 = 0x1F;
+const compressed_timestamp_rollover: u32 = 0x20;
 
 pub const FileHeader = struct {
     header_size: u8,
@@ -221,6 +236,9 @@ pub const DataMessage = struct {
     local_message_type: u4,
     global_message_number: u16,
     big_endian: bool,
+    /// Non-null exactly when the record used a compressed-timestamp header: the timestamp
+    /// rebuilt from its 5-bit offset. A normal message's timestamp, if any, is field 253.
+    compressed_timestamp: ?u32,
     /// Borrowed from the matching definition, with the same lifetime: valid until that local
     /// message type is redefined or the Parser is deinitialized.
     fields: []const FieldDefinition,
@@ -316,6 +334,51 @@ pub const Value = union(enum) {
     bytes: []const u8,
 };
 
+/// Rebuilds a full timestamp from a compressed header's 5-bit offset. The offset replaces the
+/// reference's low 5 bits; when it is smaller than them, the 5-bit counter wrapped, so the
+/// result moves into the next 32-second window.
+fn timestamp_reconstruct(reference: u32, time_offset: u5) FitError!u32 {
+    const reference_offset = reference & compressed_timestamp_mask;
+    const base = reference & ~compressed_timestamp_mask;
+    const rollover: u32 = if (time_offset < reference_offset) compressed_timestamp_rollover else 0;
+    const timestamp = std.math.add(u32, base, @as(u32, time_offset) + rollover) catch
+        return FitError.TimestampOverflow;
+
+    // The result never goes backwards and never skips a whole window.
+    assert(timestamp >= reference);
+    assert(timestamp - reference < compressed_timestamp_rollover);
+    assert(timestamp & compressed_timestamp_mask == time_offset);
+    return timestamp;
+}
+
+/// Returns the message's timestamp field if it can anchor compressed timestamps: field 253,
+/// a single uint32, and not the invalid sentinel. A field 253 of any other shape is left as an
+/// ordinary field and is deliberately not used as a reference.
+fn timestamp_field_read(
+    fields: []const FieldDefinition,
+    raw: []const u8,
+    endian: std.builtin.Endian,
+) ?u32 {
+    var iterator = FieldIterator{ .fields = fields, .raw = raw, .endian = endian };
+    // Bounded by the field count, at most 255.
+    while (iterator.next()) |field| {
+        if (field.field_definition_number != timestamp_field_number) continue;
+        if (field.base_type != .uint32 or field.raw.len != 4) return null;
+        const value = field.element(0) orelse return null;
+        assert(value.unsigned <= std.math.maxInt(u32));
+        return @intCast(value.unsigned);
+    }
+    return null;
+}
+
+fn fields_contain(fields: []const FieldDefinition, field_definition_number: u8) bool {
+    assert(fields.len <= std.math.maxInt(u8));
+    for (fields) |field| {
+        if (field.field_definition_number == field_definition_number) return true;
+    }
+    return false;
+}
+
 /// Returns null when `bytes` holds the base type's invalid sentinel.
 fn value_decode(base_type: BaseType, bytes: []const u8, endian: std.builtin.Endian) ?Value {
     assert(bytes.len >= 1);
@@ -395,6 +458,9 @@ pub const Parser = struct {
     end: usize,
     header: FileHeader,
     definitions: [local_message_type_count]?DefinitionMessage = .{null} ** local_message_type_count,
+    /// The latest full timestamp, from field 253 of a normal message or from a reconstructed
+    /// compressed one. Compressed headers are resolved against it.
+    timestamp_reference: ?u32 = null,
 
     pub fn init(allocator: std.mem.Allocator, buffer: []const u8) FitError!Parser {
         const header = try parse_file_header(buffer);
@@ -431,14 +497,14 @@ pub const Parser = struct {
         self.position += 1;
 
         const record = switch (parse_record_header(header_byte)) {
-            // Timestamp reconstruction from the 5-bit offset isn't
-            // implemented yet — this just routes to the matching
-            // definition and returns the raw data message.
-            .compressed_timestamp => |header| try self.read_data_message(header.local_message_type),
+            .compressed_timestamp => |header| try self.read_data_message(
+                header.local_message_type,
+                header.time_offset,
+            ),
             .normal => |header| if (header.is_definition)
                 try self.read_definition_message(header)
             else
-                try self.read_data_message(header.local_message_type),
+                try self.read_data_message(header.local_message_type, null),
         };
 
         // Every record consumes at least its header byte, so iteration is bounded by data_size.
@@ -502,7 +568,8 @@ pub const Parser = struct {
         return Record{ .definition = definition };
     }
 
-    fn read_data_message(self: *Parser, local_message_type: u4) FitError!Record {
+    /// `time_offset` is set for a compressed-timestamp header and null for a normal one.
+    fn read_data_message(self: *Parser, local_message_type: u4, time_offset: ?u5) FitError!Record {
         const definition = self.definitions[local_message_type] orelse
             return FitError.UnknownLocalMessageType;
         assert(definition.local_message_type == local_message_type);
@@ -511,13 +578,28 @@ pub const Parser = struct {
         if (self.remaining() < size) return FitError.UnexpectedEof;
 
         const raw = self.buffer[self.position..][0..size];
+        const endian: std.builtin.Endian = if (definition.big_endian) .big else .little;
+        var compressed_timestamp: ?u32 = null;
+        if (time_offset) |offset| {
+            if (fields_contain(definition.fields, timestamp_field_number)) {
+                return FitError.CompressedTimestampWithTimestampField;
+            }
+            const reference = self.timestamp_reference orelse
+                return FitError.CompressedTimestampWithoutReference;
+            compressed_timestamp = try timestamp_reconstruct(reference, offset);
+            self.timestamp_reference = compressed_timestamp;
+        } else if (timestamp_field_read(definition.fields, raw, endian)) |timestamp| {
+            self.timestamp_reference = timestamp;
+        }
         self.position += size;
 
         assert(raw.len == size);
+        assert((compressed_timestamp != null) == (time_offset != null));
         return Record{ .data = DataMessage{
             .local_message_type = local_message_type,
             .global_message_number = definition.global_message_number,
             .big_endian = definition.big_endian,
+            .compressed_timestamp = compressed_timestamp,
             .fields = definition.fields,
             .raw = raw,
         } };
@@ -693,19 +775,136 @@ test "Parser: redefinition replaces the previous definition" {
     try testing.expectEqual(@as(?Record, null), try parser.next());
 }
 
-test "Parser: compressed timestamp header routes to its local type" {
-    const file = try test_file_build(testing.allocator, &test_definition_local_0 ++ [_]u8{
-        0b1_00_00101, 9, 9, 9, 9, // Compressed header, local type 0, offset 5.
+/// Definition: local type 1, little endian, global message 20, one uint8 field (heart rate),
+/// and no timestamp field, as a compressed-timestamp message's definition must be.
+const test_definition_local_1_compressed = [_]u8{ 0x41, 0, 0, 20, 0, 1, 3, 1, 0x02 };
+
+test "Parser: compressed timestamps are rebuilt against the latest full timestamp" {
+    const file = try test_file_build(testing.allocator, &test_definition_local_0 ++
+        test_definition_local_1_compressed ++ [_]u8{
+        0x00, 0x1B, 0x00, 0x00, 0x00, // Normal message, timestamp 27 (low 5 bits 27).
+        0b1_01_11110, 60, // Offset 30 >= 27: same window, timestamp 30.
+        0b1_01_00010, 61, // Offset 2 < 30: the counter wrapped, timestamp 34.
+        0b1_01_00010, 62, // Same offset again: no time passed, timestamp 34.
+        0x00, 0x00, 0x01, 0x00, 0x00, // Normal message resets the reference to 256.
+        0b1_01_00001, 63, // Timestamp 257.
     });
     defer testing.allocator.free(file);
 
     var parser = try Parser.init(testing.allocator, file);
     defer parser.deinit();
-
     _ = (try parser.next()).?.definition;
+    _ = (try parser.next()).?.definition;
+
+    const anchor = (try parser.next()).?.data;
+    try testing.expectEqual(@as(?u32, null), anchor.compressed_timestamp);
+
+    const expected = [_]u32{ 30, 34, 34 };
+    for (expected) |timestamp| {
+        const data = (try parser.next()).?.data;
+        try testing.expectEqual(@as(u4, 1), data.local_message_type);
+        try testing.expectEqual(@as(?u32, timestamp), data.compressed_timestamp);
+    }
+
+    _ = (try parser.next()).?.data;
+    const last = (try parser.next()).?.data;
+    try testing.expectEqual(@as(?u32, 257), last.compressed_timestamp);
+    try testing.expectEqualSlices(u8, &.{63}, last.raw);
+    try testing.expectEqual(@as(?Record, null), try parser.next());
+}
+
+test "Parser: an invalid or non-uint32 field 253 is not a timestamp reference" {
+    const file = try test_file_build(testing.allocator, &test_definition_local_0 ++
+        test_definition_local_1_compressed ++ [_]u8{
+        0x00, 0x10, 0x00, 0x00, 0x00, // Timestamp 16.
+        0x00, 0xFF, 0xFF, 0xFF, 0xFF, // Timestamp "no data": the reference stays 16.
+        0x42, 0, 0, 20, 0, 1, 253, 2, 0x84, // Local type 2: field 253 as a uint16.
+        0x02, 0x00, 0x01, // Field 253 = 256 as uint16: not a reference either.
+        0b1_01_10001, 1, // Offset 17 against 16: timestamp 17.
+    });
+    defer testing.allocator.free(file);
+
+    var parser = try Parser.init(testing.allocator, file);
+    defer parser.deinit();
+    var count: u32 = 0;
+    // Bounded: 7 records in the file.
+    while (count < 6) : (count += 1) _ = (try parser.next()).?;
     const data = (try parser.next()).?.data;
-    try testing.expectEqual(@as(u4, 0), data.local_message_type);
-    try testing.expectEqualSlices(u8, &.{ 9, 9, 9, 9 }, data.raw);
+    try testing.expectEqual(@as(?u32, 17), data.compressed_timestamp);
+}
+
+test "Parser: rejects compressed timestamps it cannot anchor" {
+    const cases = [_]struct { data: []const u8, expected: FitError }{
+        .{
+            .data = &test_definition_local_1_compressed ++ [_]u8{ 0b1_01_00000, 0 },
+            .expected = FitError.CompressedTimestampWithoutReference,
+        },
+        .{
+            // Local type 0's definition has field 253, so a compressed header for it conflicts.
+            .data = &test_definition_local_0 ++ [_]u8{ 0x00, 1, 0, 0, 0, 0b1_00_00001, 1, 0, 0, 0 },
+            .expected = FitError.CompressedTimestampWithTimestampField,
+        },
+        .{
+            // The largest valid timestamp, 0xFFFFFFFE, then an offset that must wrap past it.
+            .data = &test_definition_local_0 ++ test_definition_local_1_compressed ++
+                [_]u8{ 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0b1_01_00000, 0 },
+            .expected = FitError.TimestampOverflow,
+        },
+    };
+    for (cases) |case| {
+        const file = try test_file_build(testing.allocator, case.data);
+        defer testing.allocator.free(file);
+
+        var parser = try Parser.init(testing.allocator, file);
+        defer parser.deinit();
+        while (true) {
+            const record = parser.next() catch |err| {
+                try testing.expectEqual(case.expected, err);
+                break;
+            };
+            try testing.expect(record != null);
+        }
+    }
+}
+
+test "timestamp_reconstruct: windows, rollover and bounds" {
+    try testing.expectEqual(@as(u32, 0), try timestamp_reconstruct(0, 0));
+    try testing.expectEqual(@as(u32, 31), try timestamp_reconstruct(0, 31));
+    try testing.expectEqual(@as(u32, 32), try timestamp_reconstruct(31, 0));
+    try testing.expectEqual(@as(u32, 63), try timestamp_reconstruct(32, 31));
+    try testing.expectEqual(@as(u32, 1000), try timestamp_reconstruct(1000, 1000 & 0x1F));
+
+    // The largest reachable result: the last window of u32, with no rollover needed.
+    const max = std.math.maxInt(u32);
+    try testing.expectEqual(@as(u32, max), try timestamp_reconstruct(max - 31, 31));
+    try testing.expectError(FitError.TimestampOverflow, timestamp_reconstruct(max - 1, 0));
+
+    // Every (reference low bits, offset) pair stays within one rollover window.
+    var reference: u32 = 64;
+    while (reference < 96) : (reference += 1) {
+        var offset: u32 = 0;
+        while (offset <= 31) : (offset += 1) {
+            const timestamp = try timestamp_reconstruct(reference, @intCast(offset));
+            try testing.expect(timestamp >= reference and timestamp - reference < 32);
+        }
+    }
+}
+
+test "timestamp_field_read and fields_contain" {
+    const fields = [_]FieldDefinition{
+        .{ .field_definition_number = 3, .size = 1, .base_type = .uint8 },
+        .{ .field_definition_number = 253, .size = 4, .base_type = .uint32 },
+    };
+    const raw = [_]u8{ 90, 0, 0, 1, 2 };
+    try testing.expectEqual(@as(?u32, 0x02010000), timestamp_field_read(&fields, &raw, .little));
+    try testing.expectEqual(@as(?u32, 0x00000102), timestamp_field_read(&fields, &raw, .big));
+    const without_timestamp = timestamp_field_read(fields[0..1], raw[0..1], .little);
+    try testing.expectEqual(@as(?u32, null), without_timestamp);
+    try testing.expectEqual(@as(?u32, null), timestamp_field_read(&.{}, &.{}, .little));
+
+    try testing.expect(fields_contain(&fields, 253));
+    try testing.expect(!fields_contain(&fields, 4));
+    try testing.expect(!fields_contain(&.{}, 253));
 }
 
 test "Parser: rejects a bad signature" {

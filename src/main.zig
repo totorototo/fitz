@@ -27,6 +27,12 @@ const MessageLabel = struct {
     }
 };
 
+const RecordCounts = struct {
+    definition: u32 = 0,
+    /// Data messages whose timestamp was rebuilt from a compressed header.
+    compressed_timestamp: u32 = 0,
+};
+
 const Options = struct {
     dump: bool,
     path: []const u8,
@@ -84,10 +90,10 @@ pub fn main(init: std.process.Init) !void {
 
     var data_counts = std.AutoHashMap(u16, u32).init(allocator);
     defer data_counts.deinit();
-    const definition_count = try records_process(&parser, dump_writer, &data_counts);
+    const record_counts = try records_process(&parser, dump_writer, &data_counts);
     if (dump_writer) |writer| try writer.flush();
 
-    counts_print(definition_count, &data_counts, buffer.len);
+    counts_print(&record_counts, &data_counts, buffer.len);
 }
 
 /// Accepts exactly `<path>` or `--dump <path>`. Returns null on any other shape.
@@ -107,21 +113,20 @@ fn options_parse(arguments: []const [:0]const u8) ?Options {
     return options;
 }
 
-/// Returns the number of definition messages seen.
 fn records_process(
     parser: *fitz.Parser,
     dump_writer: ?*std.Io.Writer,
     data_counts: *std.AutoHashMap(u16, u32),
-) !u32 {
+) !RecordCounts {
     assert(data_counts.count() == 0);
-    var definition_count: u32 = 0;
+    var record_counts = RecordCounts{};
 
     // Bounded: every record consumes at least one byte of a data section of at most
     // file_size_max bytes.
     while (try parser.next()) |record| {
         switch (record) {
             .definition => |definition| {
-                definition_count += 1;
+                record_counts.definition += 1;
                 std.debug.print(
                     "DEF  local={d} global_msg={f} fields={d} big_endian={}\n",
                     .{
@@ -135,19 +140,22 @@ fn records_process(
             .data => |data| {
                 const entry = try data_counts.getOrPutValue(data.global_message_number, 0);
                 entry.value_ptr.* += 1;
+                if (data.compressed_timestamp != null) record_counts.compressed_timestamp += 1;
                 if (dump_writer) |writer| try data_message_write(writer, &data);
             },
         }
     }
-    return definition_count;
+    // The parser rejects a data message whose local type was never defined.
+    assert(record_counts.definition > 0 or data_counts.count() == 0);
+    return record_counts;
 }
 
 fn counts_print(
-    definition_count: u32,
+    record_counts: *const RecordCounts,
     data_counts: *const std.AutoHashMap(u16, u32),
     buffer_len: usize,
 ) void {
-    std.debug.print("\n{d} definition messages\n", .{definition_count});
+    std.debug.print("\n{d} definition messages\n", .{record_counts.definition});
     var data_count_total: u64 = 0;
     var iterator = data_counts.iterator();
     while (iterator.next()) |entry| {
@@ -159,7 +167,11 @@ fn counts_print(
         data_count_total += entry.value_ptr.*;
     }
     assert(data_count_total <= buffer_len);
-    std.debug.print("{d} data messages total\n", .{data_count_total});
+    assert(record_counts.compressed_timestamp <= data_count_total);
+    std.debug.print(
+        "{d} data messages total, {d} with a compressed timestamp\n",
+        .{ data_count_total, record_counts.compressed_timestamp },
+    );
 }
 
 /// One line per data message: `DATA local=L global_msg=G field=value ...`, where G and each
@@ -169,6 +181,9 @@ fn data_message_write(writer: *std.Io.Writer, data: *const fitz.DataMessage) !vo
         data.local_message_type,
         MessageLabel{ .global_message_number = data.global_message_number },
     });
+    // A compressed header's timestamp isn't one of the message's fields, so it is printed
+    // first, the way a normal message's field 253 would be.
+    if (data.compressed_timestamp) |timestamp| try writer.print(" timestamp={d}s", .{timestamp});
 
     var fields_written: usize = 0;
     var iterator = data.fields_iterator();
@@ -292,6 +307,7 @@ test "data_message_write: an unknown message prints numbers and raw values" {
         .local_message_type = 1,
         .global_message_number = 325,
         .big_endian = false,
+        .compressed_timestamp = null,
         .fields = &test_fields,
         .raw = &test_raw,
     };
@@ -311,6 +327,7 @@ test "data_message_write: a known message prints names, scaled values and units"
         .local_message_type = 1,
         .global_message_number = 20,
         .big_endian = false,
+        .compressed_timestamp = null,
         .fields = &test_fields,
         .raw = &test_raw,
     };
@@ -355,6 +372,7 @@ test "data_message_write: a message with no fields" {
         .local_message_type = 0,
         .global_message_number = 0,
         .big_endian = false,
+        .compressed_timestamp = null,
         .fields = &.{},
         .raw = &.{},
     };
@@ -362,4 +380,25 @@ test "data_message_write: a message with no fields" {
     var writer = std.Io.Writer.fixed(&buffer);
     try data_message_write(&writer, &data);
     try testing.expectEqualStrings("DATA local=0 global_msg=file_id\n", writer.buffered());
+}
+
+test "data_message_write: a compressed timestamp is printed before the fields" {
+    const fields = [_]fitz.FieldDefinition{
+        .{ .field_definition_number = 3, .size = 1, .base_type = .uint8 },
+    };
+    const data = fitz.DataMessage{
+        .local_message_type = 1,
+        .global_message_number = 20,
+        .big_endian = false,
+        .compressed_timestamp = 1147594040,
+        .fields = &fields,
+        .raw = &.{146},
+    };
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try data_message_write(&writer, &data);
+    try testing.expectEqualStrings(
+        "DATA local=1 global_msg=record timestamp=1147594040s heart_rate=146bpm\n",
+        writer.buffered(),
+    );
 }
