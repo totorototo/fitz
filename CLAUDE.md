@@ -65,4 +65,5 @@ Assert what *must not* happen, in addition to what should:
 
 - **Every** feature, helper or function you add ships with unit tests (`test "..." {}` blocks) in the same change.
 - Tests cover the valid space, the edge cases (0, 1, max, max+1) and the invalid space.
-- Run `zig build test` and confirm it passes before calling any work done.
+- Run `zig build test --summary all` and confirm it passes before calling any work done. Plain
+  `zig build test` prints nothing on success, so the summary is what shows the pass counts.

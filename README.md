@@ -10,7 +10,8 @@ by feature rather than all at once.
 
 ```sh
 zig build            # builds lib + cli into zig-out/
-zig build test       # runs unit tests and the tests against testdata/
+zig build test       # runs unit tests and the tests against testdata/; silent on success
+zig build test --summary all   # same, listing each test binary and its pass count
 zig build run -- path/to/file.fit
 zig build run -- --dump path/to/file.fit > dump.txt
 zig build run -- --dump --all path/to/file.fit > dump-all.txt
