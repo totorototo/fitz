@@ -112,7 +112,9 @@ by an `assert`. A failed assert means a bug in fitz, never a bad file.
   → `Value`: unsigned, signed, float, string or bytes). Numeric fields
   whose size is a multiple of the base type size are arrays.
 - Streaming `Parser.next()` — no upfront allocation of the whole record
-  list, only definition field tables are heap-allocated
+  list, only definition field tables are heap-allocated, in an arena
+  freed by `deinit`. A record stays valid until then, even after its
+  local type is redefined or the next chained file starts
 - Reads chained FIT files (several files back to back in one buffer, e.g.
   an activity followed by settings) in turn. `Parser.init` checks every
   file first, so a bad later file rejects the whole buffer before any

@@ -317,8 +317,7 @@ pub const DefinitionMessage = struct {
     local_message_type: u4,
     big_endian: bool,
     global_message_number: u16,
-    /// Owned by the Parser's allocator; valid until that local message
-    /// type is redefined or the Parser is deinitialized.
+    /// Owned by the Parser; valid until `Parser.deinit`, even after a redefinition.
     fields: []FieldDefinition,
     /// Empty unless the record header had the developer-fields bit. Same ownership as `fields`.
     developer_fields: []DeveloperFieldDefinition,
@@ -635,12 +634,15 @@ pub const Record = union(enum) {
 /// describe the file the latest record came from. Each file starts with no definitions and no
 /// timestamp reference, as a separate file would.
 ///
-/// A record's `fields` and `developer_fields` point into its definition, which a redefinition
-/// or the next file frees, so read them before the next call to `next`.
+/// A record's slices point into the buffer or into the parser's arena, so they stay valid until
+/// `deinit`, across redefinitions and files.
 /// After `next` returns an error the parser's position is unspecified;
 /// stop iterating and call `deinit`.
 pub const Parser = struct {
-    allocator: std.mem.Allocator,
+    /// Holds every definition's field tables until `deinit`. Nothing is freed on redefinition,
+    /// so records stay valid; the total stays bounded because each definition allocates at
+    /// most the 3 bytes per field definition it consumed from the buffer.
+    arena: std.heap.ArenaAllocator,
     buffer: []const u8,
     position: usize,
     end: usize,
@@ -663,7 +665,7 @@ pub const Parser = struct {
         // It costs one pass over bytes that are already in memory.
         const file_count = try files_verify(buffer);
         var parser = Parser{
-            .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
             .buffer = buffer,
             .position = undefined,
             .end = undefined,
@@ -680,14 +682,8 @@ pub const Parser = struct {
     }
 
     pub fn deinit(self: *Parser) void {
-        self.definitions_free();
-    }
-
-    fn definitions_free(self: *Parser) void {
-        for (&self.definitions) |*definition_slot| {
-            if (definition_slot.*) |definition| self.definition_free(&definition);
-            definition_slot.* = null;
-        }
+        self.arena.deinit();
+        self.* = undefined;
     }
 
     /// Points the parser at the file whose header starts at `file_start`. `init` has verified
@@ -708,16 +704,11 @@ pub const Parser = struct {
     fn file_next(self: *Parser) void {
         assert(self.position == self.end);
         assert(self.file_index + 1 < self.file_count);
-        self.definitions_free();
+        self.definitions = .{null} ** local_message_type_count;
         self.timestamp_reference = null;
         self.file_index += 1;
         self.file_load(self.end + crc_size);
         self.assert_invariants();
-    }
-
-    fn definition_free(self: *Parser, definition: *const DefinitionMessage) void {
-        self.allocator.free(definition.fields);
-        self.allocator.free(definition.developer_fields);
     }
 
     /// Returns the next record, or null once the data section of the last file is exhausted.
@@ -789,7 +780,6 @@ pub const Parser = struct {
             field_count,
             parse_field_definition,
         );
-        errdefer self.allocator.free(fields);
 
         // Without the header bit there is no count byte, which is the same as a count of 0.
         var developer_field_count: u8 = 0;
@@ -803,7 +793,6 @@ pub const Parser = struct {
             developer_field_count,
             parse_developer_field_definition,
         );
-        errdefer self.allocator.free(developer_fields);
 
         const definition = DefinitionMessage{
             .local_message_type = record_header.local_message_type,
@@ -812,17 +801,16 @@ pub const Parser = struct {
             .fields = fields,
             .developer_fields = developer_fields,
         };
-        const slot = &self.definitions[record_header.local_message_type];
-        if (slot.*) |*previous| self.definition_free(previous);
-        slot.* = definition;
+        // The previous definition's tables stay in the arena, for records that still use them.
+        self.definitions[record_header.local_message_type] = definition;
 
         assert(definition.fields.len == field_count);
         assert(definition.developer_fields.len == developer_field_count);
         return Record{ .definition = definition };
     }
 
-    /// Reads `count` 3-byte definitions of either kind into a slice the caller owns. Nothing is
-    /// allocated when the bytes are missing, and nothing leaks when one of them is invalid.
+    /// Reads `count` 3-byte definitions of either kind into the arena. Nothing is allocated when
+    /// the bytes are missing.
     fn read_field_definitions(
         self: *Parser,
         comptime Definition: type,
@@ -832,8 +820,9 @@ pub const Parser = struct {
         const size = @as(usize, count) * field_definition_size;
         if (self.remaining() < size) return FitError.UnexpectedEof;
 
-        const definitions = try self.allocator.alloc(Definition, count);
-        errdefer self.allocator.free(definitions);
+        // The arena's bound: never more bytes allocated than consumed from the buffer.
+        comptime assert(@sizeOf(Definition) <= field_definition_size);
+        const definitions = try self.arena.allocator().alloc(Definition, count);
         for (definitions, 0..) |*definition, index| {
             const offset = self.position + index * field_definition_size;
             definition.* = try parse(self.buffer[offset..][0..field_definition_size]);
@@ -1432,6 +1421,32 @@ test "Parser: a chained file doesn't inherit definitions or the timestamp refere
         try testing.expectError(case.expected, parser.next());
         try testing.expectEqual(@as(u32, 1), parser.file_index);
     }
+}
+
+test "Parser: a record stays valid after a redefinition and a file switch" {
+    const buffer = try test_files_chain(testing.allocator, &.{
+        &test_definition_local_0 ++ test_data_local_0 ++ [_]u8{
+            0x40, 0, 0, 21, 0, 1, 0, 1, 0, // Local type 0 again: global 21, one 1-byte field.
+        },
+        &test_definition_local_0,
+    });
+    defer testing.allocator.free(buffer);
+
+    var parser = try Parser.init(testing.allocator, buffer);
+    defer parser.deinit();
+    _ = (try parser.next()).?.definition;
+    const held = (try parser.next()).?.data;
+    _ = (try parser.next()).?.definition;
+    _ = (try parser.next()).?.definition;
+    try testing.expectEqual(@as(u32, 1), parser.file_index);
+    try testing.expectEqual(@as(?Record, null), try parser.next());
+
+    // The first definition was replaced, then the whole table was reset for the second file.
+    try testing.expectEqual(@as(usize, 1), held.fields.len);
+    try testing.expectEqual(timestamp_field_number, held.fields[0].field_definition_number);
+    try testing.expectEqual(BaseType.uint32, held.fields[0].base_type);
+    var iterator = held.fields_iterator();
+    try testing.expectEqual(Value{ .unsigned = 1000 }, iterator.next().?.element(0));
 }
 
 test "Parser.init: any bad chained file rejects the whole buffer" {
