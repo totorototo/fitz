@@ -1,0 +1,21 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+# Older Zig versions used this name for the cache directory.
+zig-cache/
+
+# FIT files you record yourself contain GPS tracks and health data, so don't commit them.
+# Deliberately small test fixtures can still go in testdata/.
+*.fit
+*.FIT
+!testdata/**/*.fit
+!testdata/**/*.FIT
+
+# Claude Code per-user settings
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
