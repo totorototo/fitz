@@ -11,7 +11,7 @@ Garmin, Suunto, Coros, Wahoo and most other sports devices.
 - Zero-copy and streaming: records are views into your buffer, and nothing is decoded
   until you ask.
 
-Requires **Zig 0.16.0**.
+Requires **Zig 0.17.0**.
 
 ## Quick start
 

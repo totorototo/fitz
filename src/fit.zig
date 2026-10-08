@@ -165,7 +165,7 @@ fn files_verify(buffer: []const u8) FitError!u32 {
 
 /// FIT's CRC is CRC-16/ARC: polynomial 0x8005, reflected, initial value 0, no final XOR.
 fn crc_compute(bytes: []const u8) u16 {
-    return std.hash.crc.Crc16Arc.hash(bytes);
+    return std.hash.crc.@"CRC-16/ARC".hash(bytes);
 }
 
 /// Checks the file CRC: the last two bytes of `file` against everything before them, header
@@ -175,7 +175,7 @@ fn file_crc_verify(file: []const u8) FitError!u16 {
     const content = file[0 .. file.len - crc_size];
     const crc_stored = std.mem.readInt(u16, file[content.len..][0..crc_size], .little);
 
-    var crc = std.hash.crc.Crc16Arc.init();
+    var crc = std.hash.crc.@"CRC-16/ARC".init();
     crc.update(content);
     if (crc.final() != crc_stored) return FitError.FileCrcMismatch;
 
@@ -251,7 +251,7 @@ pub const BaseType = enum(u8) {
     pub fn from_byte(byte: u8) FitError!BaseType {
         const base_type = std.enums.fromInt(BaseType, byte) orelse
             return FitError.InvalidBaseType;
-        assert(@intFromEnum(base_type) == byte);
+        assert(@backingInt(base_type) == byte);
         return base_type;
     }
 
@@ -265,7 +265,7 @@ pub const BaseType = enum(u8) {
             .float64, .sint64, .uint64, .uint64z => 8,
         };
         // The endian-ability bit is set exactly on the multi-byte types.
-        assert((result > 1) == (@intFromEnum(self) & 0x80 != 0));
+        assert((result > 1) == (@backingInt(self) & 0x80 != 0));
         return result;
     }
 };
@@ -489,7 +489,7 @@ fn parse_developer_field_description(
     var iterator = data.fields_iterator();
     // Bounded by the definition's field count, at most 255.
     while (iterator.next()) |field| {
-        switch (@as(FieldDescriptionField, @enumFromInt(field.field_definition_number))) {
+        switch (@as(FieldDescriptionField, @fromBackingInt(field.field_definition_number))) {
             .developer_data_index => developer_data_index = try description_unsigned(&field),
             .field_definition_number => field_number = try description_unsigned(&field),
             .fit_base_type_id => base_type_byte = try description_unsigned(&field),
@@ -777,7 +777,7 @@ fn signed_decode(comptime T: type, bytes: []const u8, endian: std.builtin.Endian
 /// The float sentinel is the all-ones bit pattern, which is a NaN. It must be compared as
 /// bits, because NaN never compares equal as a float.
 fn float_decode(comptime T: type, bytes: []const u8, endian: std.builtin.Endian) ?Value {
-    const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const Bits = @Int(.unsigned, @bitSizeOf(T));
     assert(bytes.len == @sizeOf(T));
     const bits = std.mem.readInt(Bits, bytes[0..@sizeOf(T)], endian);
     if (bits == std.math.maxInt(Bits)) return null;
@@ -826,7 +826,7 @@ pub const Parser = struct {
     header: FileHeader,
     /// The current file's trailing CRC, already verified by `init`.
     file_crc: u16,
-    definitions: [local_message_type_count]?DefinitionMessage = .{null} ** local_message_type_count,
+    definitions: [local_message_type_count]?DefinitionMessage = @splat(null),
     /// The latest full timestamp, from field 253 of a normal message or from a reconstructed
     /// compressed one. Compressed headers are resolved against it.
     timestamp_reference: ?u32 = null,
@@ -884,7 +884,7 @@ pub const Parser = struct {
         self.assert_invariants();
         assert(self.position == self.end);
         if (self.file_index + 1 == self.file_count) return false;
-        self.definitions = .{null} ** local_message_type_count;
+        self.definitions = @splat(null);
         self.timestamp_reference = null;
         self.developer_field_descriptions.clear();
         self.file_index += 1;
@@ -1211,16 +1211,16 @@ test "DefinitionMessage.message_size" {
     try testing.expectEqual(@as(u32, 0), definition.developer_fields_size());
 
     // The largest message: 255 standard and 255 developer fields of 255 bytes each.
-    var fields_max = [_]FieldDefinition{.{
+    var fields_max: [255]FieldDefinition = @splat(.{
         .field_definition_number = 0,
         .size = 255,
         .base_type = .byte,
-    }} ** 255;
-    var developer_fields_max = [_]DeveloperFieldDefinition{.{
+    });
+    var developer_fields_max: [255]DeveloperFieldDefinition = @splat(.{
         .field_number = 0,
         .size = 255,
         .developer_data_index = 0,
-    }} ** 255;
+    });
     definition.fields = &fields_max;
     definition.developer_fields = &developer_fields_max;
     try testing.expectEqual(@as(u32, 2 * 255 * 255), definition.message_size());
@@ -1432,7 +1432,7 @@ test "timestamp_field_read and fields_contain" {
 }
 
 test "Parser: rejects a bad signature" {
-    var bad = [_]u8{0} ** 12;
+    var bad: [12]u8 = @splat(0);
     bad[0] = 12;
     try testing.expectError(FitError.InvalidSignature, Parser.init(testing.allocator, &bad));
 }
@@ -1463,7 +1463,7 @@ test "crc_compute: matches the CRC-16/ARC check value and the FIT SDK algorithm"
     }
     const header = [_]u8{ 14, 0x20, 0x6C, 0x08, 0x10, 0x27, 0, 0, '.', 'F', 'I', 'T' };
     try testing.expectEqual(test_crc_fit_sdk(&header), crc_compute(&header));
-    const long = [_]u8{0xA5} ** 1000;
+    const long: [1000]u8 = @splat(0xA5);
     try testing.expectEqual(test_crc_fit_sdk(&long), crc_compute(&long));
 }
 
@@ -1487,7 +1487,7 @@ test "Parser: verifies the file CRC over the header and data" {
 
 test "Parser: a 14-byte header's CRC is part of the file CRC" {
     const data = test_definition_local_0;
-    var file = [_]u8{0} ** (header_size_long + data.len + crc_size);
+    var file: [header_size_long + data.len + crc_size]u8 = @splat(0);
     file[0] = header_size_long;
     std.mem.writeInt(u32, file[4..8], data.len, .little);
     @memcpy(file[signature_offset..][0..signature.len], signature);
@@ -1708,7 +1708,7 @@ test "BaseType.from_byte: accepts exactly the 17 canonical bytes" {
             try testing.expectEqual(FitError.InvalidBaseType, err);
             continue;
         };
-        try testing.expectEqual(@as(u8, @intCast(byte)), @intFromEnum(base_type));
+        try testing.expectEqual(@as(u8, @intCast(byte)), @backingInt(base_type));
         accepted += 1;
     }
     try testing.expectEqual(@as(u32, 17), accepted);
@@ -1758,13 +1758,13 @@ test "value_decode: unsigned and z variants" {
     try testing.expectEqual(Value{ .unsigned = 0x0102 }, value_decode(.uint16, &.{ 1, 2 }, .big).?);
     try testing.expectEqual(@as(?Value, null), value_decode(.uint16, &.{ 0xFF, 0xFF }, little));
     try testing.expectEqual(@as(?Value, null), value_decode(.uint16z, &.{ 0, 0 }, little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.uint32, &(.{0xFF} ** 4), little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.uint32z, &(.{0} ** 4), little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.uint64, &(.{0xFF} ** 8), little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.uint64z, &(.{0} ** 8), little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.uint32, &@as([4]u8, @splat(0xFF)), little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.uint32z, &@as([4]u8, @splat(0)), little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.uint64, &@as([8]u8, @splat(0xFF)), little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.uint64z, &@as([8]u8, @splat(0)), little));
 
     const max_valid = std.math.maxInt(u64) - 1;
-    const bytes = [_]u8{0xFE} ++ [_]u8{0xFF} ** 7;
+    const bytes = [_]u8{0xFE} ++ @as([7]u8, @splat(0xFF));
     const uint64_max = value_decode(.uint64, &bytes, little).?;
     try testing.expectEqual(Value{ .unsigned = max_valid }, uint64_max);
 }
@@ -1780,9 +1780,9 @@ test "value_decode: signed uses the maximum positive value as its sentinel" {
     try testing.expectEqual(@as(?Value, null), value_decode(.sint16, &.{ 0xFF, 0x7F }, little));
     const sint32_invalid = [_]u8{ 0x7F, 0xFF, 0xFF, 0xFF };
     try testing.expectEqual(@as(?Value, null), value_decode(.sint32, &sint32_invalid, .big));
-    const sint64_invalid = [_]u8{0xFF} ** 7 ++ [_]u8{0x7F};
+    const sint64_invalid = @as([7]u8, @splat(0xFF)) ++ [_]u8{0x7F};
     try testing.expectEqual(@as(?Value, null), value_decode(.sint64, &sint64_invalid, little));
-    const sint64_min = [_]u8{0} ** 7 ++ [_]u8{0x80};
+    const sint64_min = @as([7]u8, @splat(0)) ++ [_]u8{0x80};
     const min = std.math.minInt(i64);
     try testing.expectEqual(Value{ .signed = min }, value_decode(.sint64, &sint64_min, little).?);
 }
@@ -1793,8 +1793,8 @@ test "value_decode: floats compare the sentinel as bits" {
     try testing.expectEqual(Value{ .float = 1.0 }, value_decode(.float32, &one_float32, little).?);
     const half_float64 = [_]u8{ 0x3F, 0xE0, 0, 0, 0, 0, 0, 0 };
     try testing.expectEqual(Value{ .float = 0.5 }, value_decode(.float64, &half_float64, .big).?);
-    try testing.expectEqual(@as(?Value, null), value_decode(.float32, &(.{0xFF} ** 4), little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.float64, &(.{0xFF} ** 8), little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.float32, &@as([4]u8, @splat(0xFF)), little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.float64, &@as([8]u8, @splat(0xFF)), little));
 
     // A NaN other than the all-ones pattern is data, not the sentinel.
     const nan = value_decode(.float32, &.{ 0xFE, 0xFF, 0xFF, 0xFF }, little).?;
@@ -1813,7 +1813,7 @@ test "value_decode: string and byte" {
     try testing.expectEqualSlices(u8, &.{ 0xFF, 0 }, partial.bytes);
     try testing.expectEqualSlices(u8, &.{0}, value_decode(.byte, &.{0}, little).?.bytes);
     try testing.expectEqual(@as(?Value, null), value_decode(.byte, &.{0xFF}, little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.byte, &(.{0xFF} ** 255), little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.byte, &@as([255]u8, @splat(0xFF)), little));
 }
 
 test "Field: arrays, strings and invalid elements" {
@@ -1837,7 +1837,7 @@ test "Field: arrays, strings and invalid elements" {
     try testing.expectEqual(@as(u8, 1), text.element_count());
     try testing.expectEqualStrings("edge", text.element(0).?.string);
 
-    const bytes_max = [_]u8{0} ** 255;
+    const bytes_max: [255]u8 = @splat(0);
     const blob = Field{
         .field_definition_number = 2,
         .base_type = .byte,
@@ -2064,7 +2064,7 @@ test "parse_developer_field_definition: size must be nonzero" {
 }
 
 test "DeveloperField.field: the size must fit the described base type" {
-    const bytes_max = [_]u8{0x41} ** 255;
+    const bytes_max: [255]u8 = @splat(0x41);
     var developer = DeveloperField{
         .field_number = 0,
         .developer_data_index = 0,

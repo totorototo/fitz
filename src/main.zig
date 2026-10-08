@@ -1130,9 +1130,10 @@ test "field_name_write: pads to the column, and a longer name still gets a space
     try testing.expectEqual(2 + name_column_width, writer.buffered().len);
 
     // The longest profile name has 38 characters.
-    const longest = "x" ** 38;
-    const shorter = "x" ** (name_column_width - 1);
-    const edges = [_][]const u8{ shorter, "x" ** name_column_width, longest };
+    const longest: [38]u8 = @splat('x');
+    const shorter: [name_column_width - 1]u8 = @splat('x');
+    const exact: [name_column_width]u8 = @splat('x');
+    const edges = [_][]const u8{ &shorter, &exact, &longest };
     const widths = [_]usize{ name_column_width, name_column_width + 1, longest.len + 1 };
     for (edges, widths) |name, width| {
         writer = std.Io.Writer.fixed(&buffer);
