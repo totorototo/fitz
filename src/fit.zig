@@ -1758,10 +1758,14 @@ test "value_decode: unsigned and z variants" {
     try testing.expectEqual(Value{ .unsigned = 0x0102 }, value_decode(.uint16, &.{ 1, 2 }, .big).?);
     try testing.expectEqual(@as(?Value, null), value_decode(.uint16, &.{ 0xFF, 0xFF }, little));
     try testing.expectEqual(@as(?Value, null), value_decode(.uint16z, &.{ 0, 0 }, little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.uint32, &@as([4]u8, @splat(0xFF)), little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.uint32z, &@as([4]u8, @splat(0)), little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.uint64, &@as([8]u8, @splat(0xFF)), little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.uint64z, &@as([8]u8, @splat(0)), little));
+    const ones_4: [4]u8 = @splat(0xFF);
+    const zeros_4: [4]u8 = @splat(0);
+    const ones_8: [8]u8 = @splat(0xFF);
+    const zeros_8: [8]u8 = @splat(0);
+    try testing.expectEqual(@as(?Value, null), value_decode(.uint32, &ones_4, little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.uint32z, &zeros_4, little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.uint64, &ones_8, little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.uint64z, &zeros_8, little));
 
     const max_valid = std.math.maxInt(u64) - 1;
     const bytes = [_]u8{0xFE} ++ @as([7]u8, @splat(0xFF));
@@ -1793,8 +1797,10 @@ test "value_decode: floats compare the sentinel as bits" {
     try testing.expectEqual(Value{ .float = 1.0 }, value_decode(.float32, &one_float32, little).?);
     const half_float64 = [_]u8{ 0x3F, 0xE0, 0, 0, 0, 0, 0, 0 };
     try testing.expectEqual(Value{ .float = 0.5 }, value_decode(.float64, &half_float64, .big).?);
-    try testing.expectEqual(@as(?Value, null), value_decode(.float32, &@as([4]u8, @splat(0xFF)), little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.float64, &@as([8]u8, @splat(0xFF)), little));
+    const ones_4: [4]u8 = @splat(0xFF);
+    const ones_8: [8]u8 = @splat(0xFF);
+    try testing.expectEqual(@as(?Value, null), value_decode(.float32, &ones_4, little));
+    try testing.expectEqual(@as(?Value, null), value_decode(.float64, &ones_8, little));
 
     // A NaN other than the all-ones pattern is data, not the sentinel.
     const nan = value_decode(.float32, &.{ 0xFE, 0xFF, 0xFF, 0xFF }, little).?;
@@ -1813,7 +1819,8 @@ test "value_decode: string and byte" {
     try testing.expectEqualSlices(u8, &.{ 0xFF, 0 }, partial.bytes);
     try testing.expectEqualSlices(u8, &.{0}, value_decode(.byte, &.{0}, little).?.bytes);
     try testing.expectEqual(@as(?Value, null), value_decode(.byte, &.{0xFF}, little));
-    try testing.expectEqual(@as(?Value, null), value_decode(.byte, &@as([255]u8, @splat(0xFF)), little));
+    const ones_max: [255]u8 = @splat(0xFF);
+    try testing.expectEqual(@as(?Value, null), value_decode(.byte, &ones_max, little));
 }
 
 test "Field: arrays, strings and invalid elements" {
