@@ -170,6 +170,10 @@ zig build test --summary all
 
 ## Licenses
 
-`src/profile_generated.zig` is derived from the FIT SDK and covered by Garmin's FIT Protocol
-License. The files in `testdata/` come from
-[python-fitparse](https://github.com/dtcooper/python-fitparse) (MIT); see `testdata/README.md`.
+fitz is MIT, see `LICENSE`, with two exceptions:
+
+- `src/profile_generated.zig` is derived from the FIT SDK and covered by Garmin's FIT Protocol
+  License. Its §2.d forbids putting it under a license that requires sharing source (GPL,
+  AGPL), so neither fitz nor anything that bundles it can be copyleft.
+- The files in `testdata/` come from
+  [python-fitparse](https://github.com/dtcooper/python-fitparse) (MIT); see `testdata/README.md`.
