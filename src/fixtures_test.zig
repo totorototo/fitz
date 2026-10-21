@@ -193,8 +193,7 @@ test "activity-filecrc.fit and activity-unexpected-eof.fit are rejected before a
 
 test "coros-pace-2-cycling-misaligned-fields.fit: the strict base-type policy rejects it" {
     // An event message (21) defines field 3 as a uint32 of size 1. The FIT SDK and fitparse fall
-    // back to bytes and read 11293 messages; fitz rejects the definition. If the policy is
-    // relaxed, this test turns into a count check.
+    // back to bytes and read 11293 messages; fitz's default rejects the definition.
     var parser = try fitz.Parser.init(testing.allocator, @embedFile(
         "coros-pace-2-cycling-misaligned-fields.fit",
     ));
@@ -207,6 +206,32 @@ test "coros-pace-2-cycling-misaligned-fields.fit: the strict base-type policy re
     };
     try testing.expectEqual(fitz.FitError.InvalidFieldSize, result);
     try testing.expect(records > 0);
+}
+
+test "coros-pace-2-cycling-misaligned-fields.fit: read as bytes, every message reads" {
+    var parser = try fitz.Parser.init_options(testing.allocator, @embedFile(
+        "coros-pace-2-cycling-misaligned-fields.fit",
+    ), .{ .field_size_mismatch = .bytes });
+    defer parser.deinit();
+    var data_messages: u32 = 0;
+    var event_bytes: u32 = 0;
+    while (try parser.next()) |record| {
+        const data = switch (record) {
+            .data => |data| data,
+            .definition => continue,
+        };
+        data_messages += 1;
+        if (data.global_message_number != 21) continue;
+        for (data.fields) |field| {
+            if (field.field_definition_number != 3) continue;
+            // The mis-sized uint32 arrives as its one byte, as the SDK reads it.
+            if (field.base_type == .byte and field.size == 1) event_bytes += 1;
+        }
+    }
+    // fitparse's and the FIT SDK's count for this file.
+    try testing.expectEqual(@as(u32, 11293), data_messages);
+    try testing.expect(event_bytes > 0);
+    try testing.expect(parser.field_size_mismatch_count > 0);
 }
 
 const file_count_max = 8;

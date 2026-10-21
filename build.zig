@@ -76,6 +76,24 @@ pub fn build(b: *std.Build) void {
     }
     const fixtures_tests = b.addTest(.{ .root_module = fixtures_module });
     test_step.dependOn(&b.addRunArtifact(fixtures_tests).step);
+
+    // The robustness tests damage the fixtures, so they embed them too, in their own module.
+    // `zig build test --fuzz` runs the fuzz test with coverage guidance.
+    const fuzz_module = b.createModule(.{
+        .root_source_file = b.path("src/fuzz_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "fitz", .module = fitz_mod },
+        },
+    });
+    for (fixtures) |fixture| {
+        fuzz_module.addAnonymousImport(fixture, .{
+            .root_source_file = b.path(b.fmt("testdata/{s}", .{fixture})),
+        });
+    }
+    const fuzz_tests = b.addTest(.{ .root_module = fuzz_module });
+    test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
 }
 
 /// Files in testdata/ that src/fixtures_test.zig embeds. See testdata/README.md.

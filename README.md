@@ -20,7 +20,13 @@ zig build
 zig-out/bin/fitz activity.fit                     # summary: header, CRCs, message counts
 zig-out/bin/fitz --dump activity.fit              # every message, readable
 zig-out/bin/fitz --dump --all activity.fit        # every field as stored, one line each
+zig-out/bin/fitz --lenient coros.fit              # read mis-sized fields as bytes (Coros)
 ```
+
+By default fitz refuses a file with a field whose size doesn't fit its base type (Coros writes
+a uint32 of size 1). `--lenient`, or `Parser.init_options(…, .{ .field_size_mismatch = .bytes })`
+in the library, reads such a field as bytes, as the FIT SDK and fitparse do, and says how
+many it read so.
 
 `--dump` prints a block per message, with values scaled, named and converted
 (dates in ISO 8601, positions in degrees):
@@ -79,7 +85,7 @@ fn records_print(allocator: std.mem.Allocator, bytes: []const u8) !void {
             .data => |data| data,
             .definition => continue,
         };
-        if (data.global_message_number != 20) continue; // 20 is `record`
+        if (data.global_message_number != @backingInt(fitz.profile.Message.record)) continue;
 
         var fields = data.fields_iterator();
         while (fields.next()) |field| {
@@ -102,6 +108,8 @@ Useful next steps from there:
 | Developer fields (Stryd, Connect IQ apps) | `data.developer_fields_iterator()`, `parser.developer_field_descriptions.get(&field)` |
 | Several FIT files chained in one buffer | `parser.file_index` / `file_count`, or `next_in_file()` + `file_advance()` |
 | A message's name | `fitz.profile.message_name(number)` |
+| A message or field number by name | `@backingInt(fitz.profile.Message.session)`, `@backingInt(fitz.profile.FieldNumber(.record).heart_rate)` |
+| Files from any vendor (Coros) | `fitz.Parser.init_options(allocator, bytes, .{ .field_size_mismatch = .bytes })` |
 
 The parser does no I/O: you pass it bytes, and a record stays valid until `deinit`.
 
@@ -128,8 +136,16 @@ The parser does no I/O: you pass it bytes, and a record stays valid until `deini
 ## Development
 
 ```sh
-zig build test --summary all        # unit tests, real-file fixtures and CLI snapshots
+zig build test --summary all        # unit tests, fixtures, CLI snapshots, mutation test
+mkdir -p .zig-cache/tmp && zig build test --fuzz   # coverage-guided fuzzing, until stopped
 ```
+
+**Robustness** (`src/fuzz_test.zig`): whatever the bytes, fitz must answer with records or a
+`FitError`, never a panic or a failed assert. The tests wrap their bytes in a valid header and
+CRCs, so they reach the records rather than stopping at the CRC. Every run damages each fixture
+300 ways (seeded, so a failure reproduces); `--fuzz` explores from the fixtures with coverage
+guidance and serves its progress on a local web page. Zig's fuzzer needs `.zig-cache/tmp/` to
+exist.
 
 CI also checks `zig fmt`, a 100-column line limit, and runs the tests in Debug and ReleaseSafe
 on Linux, macOS and Windows. The code follows
@@ -142,6 +158,7 @@ src/profile.zig             profile lookups (names, units, scaling, subfields)
 src/profile_generated.zig   profile tables, generated: don't edit
 src/main.zig                the CLI
 src/fixtures_test.zig       tests against real files in testdata/
+src/fuzz_test.zig           robustness: damaged fixtures, and the fuzz harness
 src/snapshots/              approved CLI output, compared byte for byte
 tools/profile_generate.py   regenerates the profile tables
 ```

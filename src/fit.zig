@@ -277,12 +277,31 @@ pub const FieldDefinition = struct {
     base_type: BaseType,
 };
 
+/// What the parser does with a field whose size isn't a multiple of its base type's size (a
+/// uint32 of size 1). Coros writes such fields; the FIT SDK and fitparse read them as bytes.
+pub const FieldSizeMismatch = enum {
+    /// `FitError.InvalidFieldSize`: every element read stays aligned by construction.
+    reject,
+    /// Read the field as `byte`, like the SDK. Its values are then `Value.bytes`, and
+    /// `Parser.field_size_mismatch_count` says how many fields were read so.
+    bytes,
+};
+
+pub const Options = struct {
+    field_size_mismatch: FieldSizeMismatch = .reject,
+};
+
+/// Whether a field definition's size fits its base type. A zero size never does.
+fn field_size_fits(size: u8, base_type: BaseType) bool {
+    return size != 0 and size % base_type.size() == 0;
+}
+
 fn parse_field_definition(bytes: *const [field_definition_size]u8) FitError!FieldDefinition {
     const base_type = try BaseType.from_byte(bytes[2]);
     const size = bytes[1];
     // The FIT SDK decodes a mis-sized field as a byte array; rejecting it instead keeps every
     // later element read aligned by construction, with no fallback path to test.
-    if (size == 0 or size % base_type.size() != 0) return FitError.InvalidFieldSize;
+    if (!field_size_fits(size, base_type)) return FitError.InvalidFieldSize;
 
     const field = FieldDefinition{
         .field_definition_number = bytes[0],
@@ -290,6 +309,24 @@ fn parse_field_definition(bytes: *const [field_definition_size]u8) FitError!Fiel
         .base_type = base_type,
     };
     assert(field.size >= field.base_type.size());
+    return field;
+}
+
+/// `parse_field_definition` for `FieldSizeMismatch.bytes`: a mis-sized field becomes a byte
+/// array, which every nonzero size fits. A zero size is still invalid: there is nothing to read.
+fn parse_field_definition_lenient(
+    bytes: *const [field_definition_size]u8,
+) FitError!FieldDefinition {
+    const base_type = try BaseType.from_byte(bytes[2]);
+    const size = bytes[1];
+    if (size == 0) return FitError.InvalidFieldSize;
+    const field = FieldDefinition{
+        .field_definition_number = bytes[0],
+        .size = size,
+        .base_type = if (field_size_fits(size, base_type)) base_type else .byte,
+    };
+    assert(field_size_fits(field.size, field.base_type));
+    assert(field.base_type == base_type or field.base_type == .byte);
     return field;
 }
 
@@ -834,8 +871,20 @@ pub const Parser = struct {
     /// the record `next` just returned; a later description, or the next file, can change the
     /// answer.
     developer_field_descriptions: DeveloperFieldDescriptions = .{},
+    options: Options = .{},
+    /// With `FieldSizeMismatch.bytes`, the field definitions read so far, in every file, whose
+    /// size didn't fit their base type and were read as bytes. Always 0 with `.reject`.
+    field_size_mismatch_count: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, buffer: []const u8) FitError!Parser {
+        return init_options(allocator, buffer, .{});
+    }
+
+    pub fn init_options(
+        allocator: std.mem.Allocator,
+        buffer: []const u8,
+        options: Options,
+    ) FitError!Parser {
         // Verifying every file before the first record means no record is ever returned from a
         // buffer with a corrupted or truncated file anywhere in it, even a later chained one.
         // It costs one pass over bytes that are already in memory.
@@ -850,6 +899,7 @@ pub const Parser = struct {
             .file_count = file_count,
             .header = undefined,
             .file_crc = undefined,
+            .options = options,
         };
         parser.file_load(0);
         assert(parser.file_count >= 1);
@@ -965,11 +1015,23 @@ pub const Parser = struct {
         const field_count = fixed[4];
         self.position += definition_fixed_size;
 
-        const fields = try self.read_field_definitions(
-            FieldDefinition,
-            field_count,
-            parse_field_definition,
+        const fields_start = self.position;
+        const fields = switch (self.options.field_size_mismatch) {
+            .reject => try self.read_field_definitions(
+                FieldDefinition,
+                field_count,
+                parse_field_definition,
+            ),
+            .bytes => try self.read_field_definitions(
+                FieldDefinition,
+                field_count,
+                parse_field_definition_lenient,
+            ),
+        };
+        self.field_size_mismatch_count += fields_mismatched_count(
+            self.buffer[fields_start..self.position],
         );
+        assert(self.options.field_size_mismatch == .bytes or self.field_size_mismatch_count == 0);
 
         // Without the header bit there is no count byte, which is the same as a count of 0.
         var developer_field_count: u8 = 0;
@@ -997,6 +1059,22 @@ pub const Parser = struct {
         assert(definition.fields.len == field_count);
         assert(definition.developer_fields.len == developer_field_count);
         return Record{ .definition = definition };
+    }
+
+    /// How many of the field definitions in `bytes`, already parsed, declare a size that doesn't
+    /// fit their base type. At most 255: a definition holds at most 255 fields.
+    fn fields_mismatched_count(bytes: []const u8) u32 {
+        assert(bytes.len % field_definition_size == 0);
+        assert(bytes.len <= 255 * field_definition_size);
+        var count: u32 = 0;
+        var offset: usize = 0;
+        while (offset < bytes.len) : (offset += field_definition_size) {
+            // Parsed already, so the base type byte is valid.
+            const base_type = BaseType.from_byte(bytes[offset + 2]) catch unreachable;
+            if (!field_size_fits(bytes[offset + 1], base_type)) count += 1;
+        }
+        assert(count <= bytes.len / field_definition_size);
+        return count;
     }
 
     /// Reads `count` 3-byte definitions of either kind into the arena. Nothing is allocated when
@@ -1743,6 +1821,40 @@ test "parse_field_definition: size must be a nonzero multiple of the base type s
     try testing.expectError(FitError.InvalidFieldSize, parse_field_definition(&.{ 0, 3, 0x84 }));
     try testing.expectError(FitError.InvalidFieldSize, parse_field_definition(&.{ 0, 255, 0x89 }));
     try testing.expectError(FitError.InvalidBaseType, parse_field_definition(&.{ 0, 1, 0xFF }));
+}
+
+test "parse_field_definition_lenient: a mis-sized field becomes bytes, a zero size is invalid" {
+    // Fits: unchanged, as the strict parser reads it.
+    const fits = try parse_field_definition_lenient(&.{ 3, 4, 0x84 });
+    try testing.expectEqual(BaseType.uint16, fits.base_type);
+    try testing.expectEqual(@as(u8, 4), fits.size);
+    // A uint32 of size 1 (Coros) and a uint16 of size 3: byte arrays of that size.
+    const coros = try parse_field_definition_lenient(&.{ 3, 1, 0x86 });
+    try testing.expectEqual(BaseType.byte, coros.base_type);
+    try testing.expectEqual(@as(u8, 1), coros.size);
+    const odd = try parse_field_definition_lenient(&.{ 0, 3, 0x84 });
+    try testing.expectEqual(BaseType.byte, odd.base_type);
+    try testing.expectEqual(@as(u8, 3), odd.size);
+
+    try testing.expectError(
+        FitError.InvalidFieldSize,
+        parse_field_definition_lenient(&.{ 0, 0, 0x02 }),
+    );
+    try testing.expectError(
+        FitError.InvalidBaseType,
+        parse_field_definition_lenient(&.{ 0, 1, 0xFF }),
+    );
+}
+
+test "fields_mismatched_count: counts only the sizes that don't fit" {
+    try testing.expectEqual(@as(u32, 0), Parser.fields_mismatched_count(&.{}));
+    const bytes = [_]u8{
+        0, 4, 0x84, // uint16 of size 4: fits
+        1, 1, 0x86, // uint32 of size 1: doesn't
+        2, 3, 0x84, // uint16 of size 3: doesn't
+        3, 1, 0x02, // uint8 of size 1: fits
+    };
+    try testing.expectEqual(@as(u32, 2), Parser.fields_mismatched_count(&bytes));
 }
 
 test "value_decode: unsigned and z variants" {

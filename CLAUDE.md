@@ -7,7 +7,8 @@ the binary activity format written by Garmin, Suunto, Coros, Wahoo, etc. It grow
 at a time, not all at once.
 
 - `src/fit.zig`: the core parser. It is pure and does no I/O: it parses an in-memory `[]const u8`.
-- `src/main.zig`: the CLI (`zig build run -- [--dump [--all]] file.fit`). All I/O lives here.
+- `src/main.zig`: the CLI (`zig build run -- [--lenient] [--dump [--all]] file.fit`). All I/O
+  lives here. `--lenient` reads mis-sized fields as bytes (`FieldSizeMismatch.bytes`).
   `--dump` is for reading (a block per message, known fields with data, dates and degrees);
   `--dump --all` is one grep-able line per message with every field as stored. Both decode
   developer fields the file describes (field_description, 206).
@@ -17,6 +18,14 @@ at a time, not all at once.
   the generated file by hand: fix the generator and regenerate. It is Garmin-derived (FIT
   Protocol License), so keep its header notice.
 - `src/root.zig`: the library entry point.
+- `profile.Message` and `profile.FieldNumber(message)`: the profile's numbers by name, as enums
+  built at compile time from the generated tables (`@backingInt(Message.record)` is 20). Use
+  them rather than bare numbers, in fitz and in the apps.
+- `src/fuzz_test.zig`: whatever the bytes, records or a `FitError`, never a panic or a failed
+  assert. A seeded mutation test of every fixture runs with `zig build test`; the same harness
+  runs coverage-guided with `zig build test --fuzz` (needs `.zig-cache/tmp/`). Both wrap their
+  bytes in a valid header and CRCs so they reach the records. A crash it finds is a bug in fitz:
+  fix it and add the input as a regression test.
 - `src/fixtures_test.zig` + `testdata/`: tests against real third-party FIT files, embedded by
   name (list them in `build.zig` `fixtures`). Expected values must come from outside fitz
   (fitparse's tests/CSV, or cross-checks within the file), not from fitz's own output. Never
@@ -40,7 +49,9 @@ at a time, not all at once.
 - **Not yet supported**: profile components, and a field_description's array,
   components and native-field entries.
 - **Error policy**: `FitError` is for invalid external bytes. An `assert` is for parser invariants,
-  so a failed assert means a bug in fitz, never a bad file.
+  so a failed assert means a bug in fitz, never a bad file. A field whose size doesn't fit its
+  base type is `InvalidFieldSize` by default; `Options.field_size_mismatch = .bytes` reads it as
+  bytes, like the FIT SDK, and counts it in `Parser.field_size_mismatch_count`.
 - **Targets Zig 0.17.0**: I/O needs an explicit `std.Io`, `main` takes `std.process.Init`,
   and containers are unmanaged (`.empty` + pass the allocator on each call).
   0.17: no `**` (use `@splat`), `@Int` replaces `std.meta.Int`, `@backingInt` /

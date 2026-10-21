@@ -6,7 +6,7 @@ const fitz = @import("fitz");
 const file_size_max = 64 * 1024 * 1024;
 
 const usage =
-    \\usage: fitz [--dump [--all]] <file.fit>
+    \\usage: fitz [--lenient] [--dump [--all]] <file.fit>
     \\  --dump  print each data message to stdout as a block, one field per line: the
     \\          fields the built-in profile knows and that hold data, named, scaled, with
     \\          units, dates in ISO 8601 and positions in degrees, then the developer
@@ -15,7 +15,9 @@ const usage =
     \\          as -, unknown fields by number, dates and positions as stored, and
     \\          developer fields as dev:<developer_data_index>:<field_number>=<value>, or
     \\          =0x<bytes> when the file doesn't describe them
-    \\  via build: zig build run -- [--dump [--all]] <file.fit>
+    \\  --lenient  read a field whose size doesn't fit its base type (a uint32 of size 1,
+    \\          as Coros writes) as bytes, like the FIT SDK, instead of refusing the file
+    \\  via build: zig build run -- [--lenient] [--dump [--all]] <file.fit>
     \\
 ;
 
@@ -56,6 +58,7 @@ const Dump = struct {
 const Options = struct {
     /// Null when no dump was asked for, so `--all` without `--dump` can't be represented.
     dump: ?DumpDetail,
+    lenient: bool = false,
     path: []const u8,
 };
 
@@ -87,7 +90,9 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(buffer);
     assert(buffer.len <= file_size_max);
 
-    var parser = try fitz.Parser.init(allocator, buffer);
+    var parser = try fitz.Parser.init_options(allocator, buffer, .{
+        .field_size_mismatch = if (options.lenient) .bytes else .reject,
+    });
     defer parser.deinit();
 
     // The dump goes to stdout so it can be piped or redirected on its own; the header and
@@ -110,6 +115,12 @@ pub fn main(init: std.process.Init) !void {
     if (dump) |active| try active.writer.flush();
 
     try counts_write(log, &record_counts, &data_counts, buffer.len);
+    if (parser.field_size_mismatch_count > 0) {
+        try log.print(
+            "{d} field definitions didn't fit their base type and were read as bytes\n",
+            .{parser.field_size_mismatch_count},
+        );
+    }
 }
 
 /// Announces the file the parser is in: its header line in the log (stderr) and, when the
@@ -169,20 +180,23 @@ fn file_marker_write(
     }
 }
 
-/// Accepts `[--dump [--all]] <path>`, with each flag at most once, in either order. Returns
-/// null on any other shape.
+/// Accepts `[--lenient] [--dump [--all]] <path>`, with each flag at most once, in any order.
+/// Returns null on any other shape.
 fn options_parse(arguments: []const [:0]const u8) ?Options {
-    if (arguments.len < 2 or arguments.len > 4) return null;
+    if (arguments.len < 2 or arguments.len > 5) return null;
     const path = arguments[arguments.len - 1];
 
     var dump = false;
     var all = false;
-    // Bounded: at most two flags, by the length check above.
+    var lenient = false;
+    // Bounded: at most three flags, by the length check above.
     for (arguments[1 .. arguments.len - 1]) |flag| {
         if (std.mem.eql(u8, flag, "--dump") and !dump) {
             dump = true;
         } else if (std.mem.eql(u8, flag, "--all") and !all) {
             all = true;
+        } else if (std.mem.eql(u8, flag, "--lenient") and !lenient) {
+            lenient = true;
         } else {
             return null;
         }
@@ -195,6 +209,7 @@ fn options_parse(arguments: []const [:0]const u8) ?Options {
 
     const options = Options{
         .dump = if (!dump) null else if (all) .all else .readable,
+        .lenient = lenient,
         .path = path,
     };
     assert(options.path.ptr == arguments[arguments.len - 1].ptr);
@@ -736,6 +751,15 @@ test "options_parse" {
     try testing.expectEqual(@as(?Options, null), flag_path);
     const too_many = options_parse(&.{ "fitz", "--dump", "--all", "--all", "a.fit" });
     try testing.expectEqual(@as(?Options, null), too_many);
+
+    // `--lenient` alone, with the dump flags in any order, and at most once.
+    try testing.expect(!plain.lenient);
+    try testing.expect(options_parse(&.{ "fitz", "--lenient", "a.fit" }).?.lenient);
+    const lenient_all = options_parse(&.{ "fitz", "--dump", "--lenient", "--all", "a.fit" }).?;
+    try testing.expect(lenient_all.lenient);
+    try testing.expectEqual(@as(?DumpDetail, .all), lenient_all.dump);
+    const lenient_twice = options_parse(&.{ "fitz", "--lenient", "--lenient", "a.fit" });
+    try testing.expectEqual(@as(?Options, null), lenient_twice);
 
     try testing.expectEqual(@as(?Options, null), options_parse(&.{"fitz"}));
     try testing.expectEqual(@as(?Options, null), options_parse(&.{ "fitz", "" }));
