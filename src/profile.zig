@@ -186,6 +186,42 @@ fn message_find(global_message_number: u16) ?*const generated.Message {
     return &messages[index];
 }
 
+/// The profile's messages by name, so code reads `Message.record` rather than 20:
+/// `@backingInt(Message.record)` is the global message number. Built from the generated table
+/// at compile time, so a name can't drift from its number.
+pub const Message = message_enum: {
+    @setEvalBranchQuota(100_000);
+    const messages = &generated.messages;
+    var names: [messages.len][:0]const u8 = undefined;
+    var numbers: [messages.len]u16 = undefined;
+    for (messages, &names, &numbers) |message, *name, *number| {
+        name.* = name_terminated(message.name);
+        number.* = message.number;
+    }
+    break :message_enum @Enum(u16, .exhaustive, &names, &numbers);
+};
+
+/// `name` with the null terminator `@Enum` wants for a field name.
+fn name_terminated(comptime name: []const u8) [:0]const u8 {
+    const terminated = name[0..name.len].* ++ [_]u8{0};
+    return terminated[0..name.len :0];
+}
+
+/// The fields of `message` by name: `@backingInt(FieldNumber(.record).heart_rate)` is 3.
+pub fn FieldNumber(comptime message: Message) type {
+    const fields = (message_find(@backingInt(message)) orelse unreachable).fields;
+    @setEvalBranchQuota(100_000);
+    var names: [fields.len][:0]const u8 = undefined;
+    var numbers: [fields.len]u8 = undefined;
+    for (fields, &names, &numbers) |field, *name, *number| {
+        name.* = name_terminated(field.name);
+        number.* = field.number;
+    }
+    // A few messages (pad) have no fields; an exhaustive enum can't be empty.
+    const mode: std.builtin.Type.Enum.Mode = if (fields.len == 0) .nonexhaustive else .exhaustive;
+    return @Enum(u8, mode, &names, &numbers);
+}
+
 /// Returns null for a message number the profile doesn't define.
 pub fn message_name(global_message_number: u16) ?[]const u8 {
     const message = message_find(global_message_number) orelse return null;
@@ -272,6 +308,32 @@ fn profile_make(entry: anytype) FieldProfile {
 }
 
 const testing = std.testing;
+
+test "Message and FieldNumber: the generated numbers, by name" {
+    // Numbers from the FIT SDK's Profile.xlsx, independent of the generator.
+    try testing.expectEqual(@as(u16, 0), @backingInt(Message.file_id));
+    try testing.expectEqual(@as(u16, 18), @backingInt(Message.session));
+    try testing.expectEqual(@as(u16, 20), @backingInt(Message.record));
+    try testing.expectEqual(@as(u16, 34), @backingInt(Message.activity));
+    try testing.expectEqual(@as(u16, 206), @backingInt(Message.field_description));
+    const Record = FieldNumber(.record);
+    try testing.expectEqual(@as(u8, 0), @backingInt(Record.position_lat));
+    try testing.expectEqual(@as(u8, 3), @backingInt(Record.heart_rate));
+    try testing.expectEqual(@as(u8, 78), @backingInt(Record.enhanced_altitude));
+    try testing.expectEqual(@as(u8, 253), @backingInt(Record.timestamp));
+    try testing.expectEqual(@as(u8, 7), @backingInt(FieldNumber(.session).total_elapsed_time));
+
+    // Every message and field round-trips through its name.
+    for (generated.messages) |message| {
+        const named = std.meta.stringToEnum(Message, message.name).?;
+        try testing.expectEqual(message.number, @backingInt(named));
+        try testing.expectEqualStrings(message.name, message_name(@backingInt(named)).?);
+    }
+    inline for (comptime std.enums.values(Message)) |message| {
+        const fields = message_find(@backingInt(message)).?.fields;
+        try testing.expectEqual(fields.len, std.enums.values(FieldNumber(message)).len);
+    }
+}
 
 test "message_name: known and unknown numbers" {
     try testing.expectEqualStrings("file_id", message_name(0).?);

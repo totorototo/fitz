@@ -23,6 +23,8 @@ pub const field_description_message = fit.field_description_message;
 pub const Value = fit.Value;
 pub const Record = fit.Record;
 pub const Parser = fit.Parser;
+pub const Options = fit.Options;
+pub const FieldSizeMismatch = fit.FieldSizeMismatch;
 
 test {
     _ = fit;
