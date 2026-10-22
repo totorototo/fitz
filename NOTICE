@@ -1,0 +1,9 @@
+fitz is MIT licensed (see LICENSE), except:
+
+src/profile_generated.zig is derived from Garmin's FIT SDK (profile.py of the FIT Python SDK,
+https://github.com/garmin/fit-python-sdk): Copyright Garmin International, Inc., licensed under
+the Flexible and Interoperable Data Transfer (FIT) Protocol License.
+
+Its section 2.d forbids putting it under a license that requires sharing source (such as the
+GPL or AGPL), so neither fitz nor any work that bundles it may be released under a copyleft
+license.

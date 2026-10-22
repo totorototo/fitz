@@ -187,7 +187,8 @@ zig build test --summary all
 
 ## Licenses
 
-fitz is MIT, see `LICENSE`, with two exceptions:
+fitz is MIT, see `LICENSE`, with two exceptions (the first is also in `NOTICE`, which ships
+with the package):
 
 - `src/profile_generated.zig` is derived from the FIT SDK and covered by Garmin's FIT Protocol
   License. Its §2.d forbids putting it under a license that requires sharing source (GPL,
